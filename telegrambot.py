@@ -1,8 +1,12 @@
+import os
+from dotenv import load_dotenv
 from typing import Final
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-TOKEN: Final = REMOVED
+
+load_dotenv()
+TOKEN: Final = os.environ["BOT_TOKEN"]
 BOT_USERNAME: Final = '@Pokemon_Card_tracker_bot'
 
 
