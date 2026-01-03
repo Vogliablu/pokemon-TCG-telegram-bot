@@ -81,3 +81,10 @@ async def watchers_for_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str
     for keycode, user_id in rows:
         out.setdefault(keycode, []).append(int(user_id))
     return out
+
+async def clear_watchlist(db: aiosqlite.Connection, user_id: int) -> int:
+    cur = await db.execute("DELETE FROM watchlist WHERE user_id = ?", (user_id,))
+    await db.commit()
+    # rowcount should be correct for DELETE; keep a safe fallback just in case.
+    removed = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+    return removed

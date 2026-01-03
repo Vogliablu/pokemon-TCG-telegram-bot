@@ -13,6 +13,7 @@ from storage import (
     add_watch as db_add_watch,
     remove_watch as db_remove_watch,
     remove_watch_by_nickname as db_remove_watch_by_nickname,
+    clear_watchlist as db_clear_watchlist,
 )
 
 
@@ -301,7 +302,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     '/watch <keycode> [nickname] - Add a card to your watchlist\n'
     '/unwatch <keycode|nickname> - Remove a card from your watchlist\n'
     '/identify - Send a photo of a card to identify its keycode\n'
-    '/watchlist - Show your current watchlist')
+    '/watchlist - Show your current watchlist\n'
+    '/clearwatchlist - Remove all cards from your watchlist (DM only)\n'
+    )
 
 async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('This is a custom command response!')
@@ -426,6 +429,33 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
+async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+
+    # Avoid running destructive ops from group chats
+    if chat and chat.type != "private":
+        await update.message.reply_text("Please DM me /clearwatchlist to clear your personal watchlist.")
+        return
+
+    # Safety confirmation
+    token = (context.args[0].lower() if context.args else "")
+    if token not in ("confirm", "yes"):
+        await update.message.reply_text(
+            "This will remove ALL cards from your watchlist.\n"
+            "To confirm, run:\n"
+            "/clearwatchlist confirm"
+        )
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    removed = await db_clear_watchlist(db, user_id)
+    await update.message.reply_text(f"Cleared your watchlist. Removed {removed} entr(y/ies).")
+
+
 # Responses
 
 def handle_response(txt: str) -> str:
@@ -465,6 +495,8 @@ async def post_init(application: Application):
         BotCommand("watch", "Add a card to your watchlist"),
         BotCommand("unwatch", "Remove a card from your watchlist"),
         BotCommand("watchlist", "Show your watchlist"),
+        BotCommand("clearwatchlist", "Remove all cards from your watchlist (DM)")
+
     ])
 
 
@@ -485,6 +517,8 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('unwatch', unwatch_command))
     app.add_handler(CommandHandler('identify', identify_command))
     app.add_handler(CommandHandler('watchlist', watchlist_command))
+    app.add_handler(CommandHandler("clearwatchlist", clearwatchlist_command))
+
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
     app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo))
