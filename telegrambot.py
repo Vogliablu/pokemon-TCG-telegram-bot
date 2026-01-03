@@ -3,11 +3,18 @@ import io
 import logging
 from dotenv import load_dotenv
 from typing import Final,Iterable, List, Set, Dict, Tuple
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, Forbidden, BadRequest
 import aiosqlite
 from db import init_db
+import sqlite3
+from storage import (
+    add_watch as db_add_watch,
+    remove_watch as db_remove_watch,
+    remove_watch_by_nickname as db_remove_watch_by_nickname,
+)
+
 
 DB_PATH = os.getenv("SQLITE_PATH", "bot.db")
 
@@ -267,7 +274,7 @@ async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TY
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
     try:
-        await add_watch(db, user.id, keycode)
+        await db_add_watch(db, user.id, keycode)
     except Exception as e:
         logger.exception("Failed to add watch: %s", e)
         await query.edit_message_text("Failed to add to watchlist due to a database error.")
@@ -288,10 +295,136 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Hello! I am your Pokemon Card Tracker Bot. Use /help to see what I can do!')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Available commands:\n/start - Start the bot\n/help - Show this help message')
+    await update.message.reply_text('Available commands:\n'
+    '/start - Start the bot\n'
+    '/help - Show this help message\n'
+    '/watch <keycode> [nickname] - Add a card to your watchlist\n'
+    '/unwatch <keycode|nickname> - Remove a card from your watchlist\n'
+    '/identify - Send a photo of a card to identify its keycode\n'
+    '/watchlist - Show your current watchlist')
 
 async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('This is a custom command response!')
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /watch <keycode> [nickname]")
+        return
+
+    keycode = normalize_keycode(context.args[0])
+    nickname = " ".join(context.args[1:]).strip() if len(context.args) > 1 else None
+
+    if nickname and len(nickname) > 32:
+        await update.message.reply_text("Nickname too long (max 32 characters).")
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+
+    try:
+        await db_add_watch(db, update.effective_user.id, keycode, nickname=nickname)
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("Nickname already used in your watchlist. Pick another one.")
+        return
+
+    if nickname:
+        await update.message.reply_text(f"Watching {keycode} as '{nickname}'.")
+    else:
+        await update.message.reply_text(f"Watching {keycode}.")
+
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /unwatch <keycode|nickname>")
+        return
+
+    token = " ".join(context.args).strip()
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    user_id = update.effective_user.id
+
+    # Prefer treating it as keycode first; if nothing removed, try nickname.
+    removed = await db_remove_watch(db, user_id, token)
+    if removed == 0:
+        removed = await db_remove_watch_by_nickname(db, user_id, token)
+
+    if removed == 0:
+        await update.message.reply_text("Nothing removed. Check the keycode/nickname.")
+    else:
+        await update.message.reply_text("Removed from your watchlist.")
+
+
+async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        await update.message.reply_text("Please DM me /identify, then send the card photo.")
+        return
+
+    # Your existing DM photo handler does the actual classification. :contentReference[oaicite:5]{index=5}
+    await update.message.reply_text(
+        "Send me a clear photo of the card here, and I'll reply with the detected keycode(s)."
+    )
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    cur = await db.execute(
+        "SELECT keycode, nickname FROM watchlist WHERE user_id = ? ORDER BY keycode",
+        (user_id,),
+    )
+    rows = await cur.fetchall()
+
+    if not rows:
+        text = (
+            "Your watchlist is empty. DM me a card photo to add one "
+            "(send a photo in a private chat and tap “Watch ...”)."
+        )
+    else:
+        max_show = 50
+        shown = rows[:max_show]
+
+        lines = ["Your watchlist:"]
+        for keycode, nickname in shown:
+            if nickname:
+                lines.append(f"- `{keycode}` — *{nickname}*")
+            else:
+                lines.append(f"- `{keycode}`")
+
+        if len(rows) > max_show:
+            lines.append(f"(+{len(rows) - max_show} more not shown)")
+
+        text = "\n".join(lines)
+
+    # If invoked in a group, prefer DM to avoid spamming/leaking lists.
+    if chat and chat.type != "private":
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="Markdown",
+            )
+            await update.message.reply_text("I sent you your watchlist in DM.")
+        except (Forbidden, BadRequest):
+            await update.message.reply_text(
+                "I can't DM you yet. Please open a private chat with me, press Start, then try /watchlist again."
+            )
+        except TelegramError:
+            await update.message.reply_text("Failed to retrieve your watchlist due to a Telegram error.")
+        return
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # Responses
 
@@ -325,6 +458,14 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     application.bot_data["db"] = await init_db(DB_PATH)
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show help"),
+        BotCommand("identify", "Identify a card from a photo (DM only)"),
+        BotCommand("watch", "Add a card to your watchlist"),
+        BotCommand("unwatch", "Remove a card from your watchlist"),
+        BotCommand("watchlist", "Show your watchlist"),
+    ])
 
 
 
@@ -332,7 +473,6 @@ async def post_init(application: Application):
 
 
 if __name__ == '__main__':
-    app = Application.builder().token(TOKEN).build()
     
 
     # init sqlite and store handle
@@ -341,10 +481,15 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('start', start_command))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CommandHandler('custom', custom_command))
+    app.add_handler(CommandHandler('watch', watch_command))
+    app.add_handler(CommandHandler('unwatch', unwatch_command))
+    app.add_handler(CommandHandler('identify', identify_command))
+    app.add_handler(CommandHandler('watchlist', watchlist_command))
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
     app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo))
     app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch:"))
+ 
 
 
 
