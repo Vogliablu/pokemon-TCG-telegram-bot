@@ -2,7 +2,7 @@ import os
 import io
 import logging
 from dotenv import load_dotenv
-from typing import Final,Iterable, List, Set, Dict, Tuple
+from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, Forbidden, BadRequest
@@ -26,16 +26,21 @@ BOT_USERNAME: Final = '@Pokemon_Card_tracker_bot'
 logger = logging.getLogger(__name__)
 
 # Helpers
+def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.user_data.get("pending_nickname_keycode"))
 
 def normalize_keycode(code: str) -> str:
     return code.strip().upper()
 
-async def classify_image(image_bytes: bytes) -> List[str]:
+async def classify_image(image_bytes: bytes, top_k: int = 3) -> List[Tuple[str, Optional[float]]]:
     """
-    Replace this stub with a real HTTP call to your classifier.
-    Must return a list of keycodes (strings). Example: ["AB12", "XY99"]
+    Return top_k candidates as (keycode, score).
+    score can be None if your classifier doesn't provide it.
+    Higher score assumed "more similar" (only used for display).
     """
-    # TODO: implement external call (aiohttp, httpx, etc.)
+    # TODO: call your classifier service and return ranked results.
+    # Example:
+    # return [("KAKA", 0.91), ("AAAA", 0.84), ("KOKO", 0.62)]
     return []
 
 async def watchers_for_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str]) -> Dict[str, List[int]]:
@@ -83,6 +88,17 @@ def build_watch_keyboard(keycodes: List[str], max_buttons: int = 8) -> InlineKey
     rows = [[InlineKeyboardButton(text=f"Watch {k}", callback_data=f"watch:{k}")] for k in norm]
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
+
+
+def build_identify_keyboard(candidates: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for k in candidates:
+        rows.append([
+            InlineKeyboardButton(text=f"Watch {k}", callback_data=f"watch:{k}"),
+            InlineKeyboardButton(text="Watch + nickname", callback_data=f"watchnick:{k}"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
 async def download_best_photo_bytes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bytes:
     """
     Downloads the highest-resolution photo from update.message.photo.
@@ -116,41 +132,48 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        raw_keycodes = await classify_image(image_bytes)
-        keycodes = [normalize_keycode(k) for k in raw_keycodes if k and k.strip()]
-        # Deduplicate while preserving order
-        deduped: List[str] = []
-        seen: Set[str] = set()
-        for k in keycodes:
-            if k not in seen:
-                seen.add(k)
-                deduped.append(k)
-        keycodes = deduped
+        ranked = await classify_image(image_bytes, top_k=3)  # [(keycode, score), ...]
+        # normalize + keep first 3 unique keycodes
+        candidates: List[Tuple[str, float | None]] = []
+        seen = set()
+        for item in ranked:
+            code = normalize_keycode(item[0])
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            candidates.append((code, item[1]))
+            if len(candidates) == 3:
+                break
     except Exception as e:
         logger.exception("Classifier failed for DM photo: %s", e)
         await update.message.reply_text("The classifier failed on that image. Please try again later.")
         return
 
-    if not keycodes:
+    if not candidates:
         await update.message.reply_text(
-            "No card keycode detected. Try a clearer photo (good lighting, straight angle, less glare)."
+            "No card detected. Try a clearer photo (good lighting, straight angle, less glare)."
         )
         return
 
-    keyboard = build_watch_keyboard(keycodes)
+    keycodes = [k for k, _ in candidates]
+    keyboard = build_identify_keyboard(keycodes)
 
-    msg_lines = [
-        "Detected keycode(s):",
-        *[f"- `{k}`" for k in keycodes[:12]],
-    ]
-    if len(keycodes) > 12:
-        msg_lines.append(f"(+{len(keycodes) - 12} more not shown)")
+    lines = ["Top matches:"]
+    for i, (k, score) in enumerate(candidates, 1):
+        if isinstance(score, (int, float)):
+            # display as percent if it looks like a similarity in [0,1]
+            if 0.0 <= float(score) <= 1.0:
+                lines.append(f"{i}. `{k}` ({float(score)*100:.1f}%)")
+            else:
+                lines.append(f"{i}. `{k}` (score: {score})")
+        else:
+            lines.append(f"{i}. `{k}`")
 
-    msg_lines.append("")
-    msg_lines.append("Tap a button below to add it to your watchlist, or use /watch <keycode>.")
+    lines.append("")
+    lines.append("Choose an option below:")
 
     await update.message.reply_text(
-        "\n".join(msg_lines),
+        "\n".join(lines),
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
@@ -247,47 +270,148 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # Callback handler for inline buttons
 async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles button presses from the DM identify message:
-      callback_data: "watch:<KEYCODE>"
-    Adds keycode to user's watchlist and acknowledges.
-    """
     query = update.callback_query
-    if not query or not query.data:
+    if not query or not query.data or not query.data.startswith("watch:"):
         return
 
-    await query.answer()  # acknowledge quickly to stop spinner
+    await query.answer()  # acknowledges the button press (stops the loading spinner)
 
-    # Expected format: watch:AB12
-    if not query.data.startswith("watch:"):
+    user = query.from_user
+    if not user:
         return
 
     keycode = normalize_keycode(query.data.split("watch:", 1)[1])
     if not keycode:
-        await query.edit_message_text("Invalid keycode.")
-        return
-
-    user = update.effective_user
-    if not user:
-        await query.edit_message_text("Could not identify user.")
+        if query.message:
+            await query.message.reply_text("Invalid keycode.")
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
     try:
-        await db_add_watch(db, user.id, keycode)
-    except Exception as e:
-        logger.exception("Failed to add watch: %s", e)
-        await query.edit_message_text("Failed to add to watchlist due to a database error.")
+        await db_add_watch(db, user.id, keycode)  # or add_watch(...) depending on your import name
+    except sqlite3.Error:
+        if query.message:
+            await query.message.reply_text("Database error while adding to watchlist.")
         return
 
-    # Keep message, but confirm action. If you prefer not to overwrite, use query.message.reply_text instead.
-    try:
-        await query.edit_message_text(f"Added `{keycode}` to your watchlist.", parse_mode="Markdown")
-    except TelegramError:
-        # If edit fails (e.g., message too old), just send a new message.
-        await context.bot.send_message(chat_id=user.id, text=f"Added {keycode} to your watchlist.")
+    text = f"Added `{keycode}` to your watchlist."
 
+    # If the button was clicked in a group, DM the user to avoid noise/leaks.
+    chat = query.message.chat if query.message else None
+    if chat and chat.type != "private":
+        try:
+            await context.bot.send_message(chat_id=user.id, text=text, parse_mode="Markdown")
+            if query.message:
+                await query.message.reply_text("Done — I sent you a DM confirmation.")
+        except (Forbidden, BadRequest):
+            if query.message:
+                await query.message.reply_text(
+                    "Added, but I can't DM you yet. Please open a private chat with me and press Start."
+                )
+        except TelegramError:
+            if query.message:
+                await query.message.reply_text("Added, but failed to send DM confirmation.")
+        return
+
+    # Private chat: just reply in the same chat
+    if query.message:
+        await query.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_watchnick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("watchnick:"):
+        return
+
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    keycode = normalize_keycode(query.data.split("watchnick:", 1)[1])
+    if not keycode:
+        await query.message.reply_text("Invalid keycode.")
+        return
+
+    # store pending state
+    context.user_data["pending_nickname_keycode"] = keycode
+
+    # Provide skip/cancel buttons (optional but recommended)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Skip nickname", callback_data=f"watchnick_skip:{keycode}")],
+        [InlineKeyboardButton("Cancel", callback_data="watchnick_cancel")],
+    ])
+
+    await query.message.reply_text(
+        f"Send the nickname for `{keycode}` (max 32 chars), or tap Skip/Cancel.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+async def handle_watchnick_aux_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+
+    if query.data == "watchnick_cancel":
+        context.user_data.pop("pending_nickname_keycode", None)
+        await query.message.reply_text("Cancelled.")
+        return
+
+    if query.data.startswith("watchnick_skip:"):
+        keycode = normalize_keycode(query.data.split("watchnick_skip:", 1)[1])
+        context.user_data.pop("pending_nickname_keycode", None)
+        await add_watch(db, user.id, keycode, nickname=None)
+        await query.message.reply_text(f"Added `{keycode}` to your watchlist.", parse_mode="Markdown")
+
+async def handle_nickname_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    keycode = context.user_data.get("pending_nickname_keycode")
+    if not keycode:
+        return  # not in nickname flow; let other handlers process
+
+    nickname = (update.message.text or "").strip()
+    if not nickname:
+        await update.message.reply_text("Nickname cannot be empty. Send a nickname, or tap Cancel.")
+        return
+
+    if nickname.lower() in ("skip", "/skip"):
+        db: aiosqlite.Connection = context.application.bot_data["db"]
+        await add_watch(db, update.effective_user.id, keycode, nickname=None)
+        context.user_data.pop("pending_nickname_keycode", None)
+        await update.message.reply_text(f"Added `{keycode}` to your watchlist.", parse_mode="Markdown")
+        return
+
+    if len(nickname) > 32:
+        await update.message.reply_text("Nickname too long (max 32). Try again, or tap Cancel.")
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    try:
+        await add_watch(db, update.effective_user.id, keycode, nickname=nickname)
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(
+            "That nickname is already used in your watchlist. Send a different nickname, or tap Cancel."
+        )
+        return
+
+    context.user_data.pop("pending_nickname_keycode", None)
+    await update.message.reply_text(
+        f"Added `{keycode}` as *{nickname}*.",
+        parse_mode="Markdown",
+    )
 
 
 # Commands
@@ -522,13 +646,30 @@ if __name__ == '__main__':
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
     app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo))
-    app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch:"))
  
+    app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch:"))
+    app.add_handler(CallbackQueryHandler(handle_watchnick_callback, pattern=r"^watchnick:"))
+    app.add_handler(CallbackQueryHandler(handle_watchnick_aux_callback, pattern=r"^watchnick_skip:|^watchnick_cancel$"))
 
+    # Group 0: stateful nickname replies (non-blocking)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_nickname_reply,
+            block=False,
+        ),
+        group=0,
+    )
 
+    # Group 1: normal text handling ("hello", fallback, etc.)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        ),
+        group=1,
+    )
 
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Errors
     app.add_error_handler(error)
 
