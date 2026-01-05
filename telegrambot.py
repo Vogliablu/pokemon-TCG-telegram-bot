@@ -3,7 +3,10 @@ import io
 import logging
 from dotenv import load_dotenv
 from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    InputFile, InputMediaPhoto
+)
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, Forbidden, BadRequest
 import aiosqlite
@@ -14,7 +17,16 @@ from storage import (
     remove_watch as db_remove_watch,
     remove_watch_by_nickname as db_remove_watch_by_nickname,
     clear_watchlist as db_clear_watchlist,
+    normalize_keycode,
+    get_card_features as db_get_card_features,
+    get_cards_by_keycodes as db_get_cards_by_keycodes,
+    set_card_telegram_file_id as db_set_card_telegram_file_id,
 )
+
+import asyncio
+import urllib.request
+from pathlib import Path
+from PIL import Image, ImageStat
 
 
 DB_PATH = os.getenv("SQLITE_PATH", "bot.db")
@@ -32,16 +44,77 @@ def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
 def normalize_keycode(code: str) -> str:
     return code.strip().upper()
 
-async def classify_image(image_bytes: bytes, top_k: int = 3) -> List[Tuple[str, Optional[float]]]:
+def avg_rgb_from_bytes(image_bytes: bytes) -> tuple[float, float, float]:
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = im.convert("RGB")
+        stat = ImageStat.Stat(im)
+        r, g, b = stat.mean
+        return float(r), float(g), float(b)
+
+async def _read_file_bytes(path: str) -> bytes:
+    p = Path(path)
+    return await asyncio.to_thread(p.read_bytes)
+
+async def _download_url_bytes(url: str) -> bytes:
+    def _dl() -> bytes:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; cardbot/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return resp.read()
+    return await asyncio.to_thread(_dl)
+
+async def load_card_image_bytes(image_path: str | None, image_url: str | None) -> bytes:
+    if image_path and image_path.strip():
+        return await _read_file_bytes(image_path.strip())
+    if image_url and image_url.strip():
+        return await _download_url_bytes(image_url.strip())
+    raise ValueError("Card has neither image_path nor image_url")
+
+async def ensure_card_index(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection) -> list[tuple[str, float, float, float]]:
     """
-    Return top_k candidates as (keycode, score).
-    score can be None if your classifier doesn't provide it.
-    Higher score assumed "more similar" (only used for display).
+    Cache card features in memory for faster classification.
+    context.application.bot_data["card_index"] = [(keycode, r,g,b), ...]
     """
-    # TODO: call your classifier service and return ranked results.
-    # Example:
-    # return [("KAKA", 0.91), ("AAAA", 0.84), ("KOKO", 0.62)]
-    return []
+    idx = context.application.bot_data.get("card_index")
+    if isinstance(idx, list) and idx:
+        return idx
+
+    rows = await db_get_card_features(db)
+    context.application.bot_data["card_index"] = rows
+    return rows
+
+async def classify_image(
+    db: aiosqlite.Connection,
+    context: ContextTypes.DEFAULT_TYPE,
+    image_bytes: bytes,
+    top_k: int = 3,
+) -> list[tuple[str, float]]:
+    """
+    Dummy classifier: nearest average RGB among all cards.
+    Returns [(keycode, similarity_0_1), ...].
+    """
+    q_r, q_g, q_b = avg_rgb_from_bytes(image_bytes)
+    index = await ensure_card_index(context, db)
+    if not index:
+        return []
+
+    max_dist = (3 * (255.0 ** 2)) ** 0.5
+    scored: list[tuple[str, float]] = []
+    for keycode, r, g, b in index:
+        dr = r - q_r
+        dg = g - q_g
+        dbb = b - q_b
+        dist = (dr * dr + dg * dg + dbb * dbb) ** 0.5
+        sim = 1.0 - (dist / max_dist)
+        if sim < 0.0:
+            sim = 0.0
+        scored.append((keycode, sim))
+
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored[:top_k]
+
 
 async def watchers_for_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str]) -> Dict[str, List[int]]:
     """
@@ -118,11 +191,16 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     """
     DM flow:
       - user sends photo to bot privately
-      - bot calls classifier
-      - bot replies with recognized keycodes + inline buttons to add watches
+      - bot classifies
+      - bot sends top-3 candidate images:
+          - uses telegram_file_id if cached
+          - otherwise loads from image_path/image_url, uploads once, then stores telegram_file_id
+      - bot replies with keycodes + inline watch buttons
     """
     if not update.message:
         return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
 
     try:
         image_bytes = await download_best_photo_bytes(update, context)
@@ -131,50 +209,97 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("I couldn't download that image. Please try again.")
         return
 
+    # Classify
     try:
-        ranked = await classify_image(image_bytes, top_k=3)  # [(keycode, score), ...]
-        # normalize + keep first 3 unique keycodes
-        candidates: List[Tuple[str, float | None]] = []
-        seen = set()
-        for item in ranked:
-            code = normalize_keycode(item[0])
-            if not code or code in seen:
-                continue
-            seen.add(code)
-            candidates.append((code, item[1]))
-            if len(candidates) == 3:
-                break
+        ranked = await classify_image(db, context, image_bytes, top_k=3)  # [(keycode, sim), ...]
     except Exception as e:
         logger.exception("Classifier failed for DM photo: %s", e)
-        await update.message.reply_text("The classifier failed on that image. Please try again later.")
+        await update.message.reply_text("Classification failed. Please try again.")
         return
 
+    # Normalize + unique
+    candidates: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for keycode, sim in ranked:
+        k = normalize_keycode(keycode)
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append((k, float(sim)))
+        if len(candidates) >= 3:
+            break
+
     if not candidates:
-        await update.message.reply_text(
-            "No card detected. Try a clearer photo (good lighting, straight angle, less glare)."
-        )
+        await update.message.reply_text("No matches found (or your card catalog is empty).")
         return
 
     keycodes = [k for k, _ in candidates]
-    keyboard = build_identify_keyboard(keycodes)
+    cards = await db_get_cards_by_keycodes(db, keycodes)
 
+    # Build media group (mix cached file_ids and new uploads)
+    media: list[InputMediaPhoto] = []
+    order: list[tuple[str, bool]] = []  # (keycode, uploaded_now?)
+
+    for idx, (k, sim) in enumerate(candidates, start=1):
+        row = cards.get(k)
+        caption = f"{idx}. {k} ({sim*100:.1f}%)"
+        if row and row[1]:
+            caption += f"\n{row[1]}"
+
+        if row and row[4]:  # telegram_file_id
+            media.append(InputMediaPhoto(media=row[4], caption=caption))
+            order.append((k, False))
+            continue
+
+        # Not cached yet => load from authoritative source and upload now
+        if not row:
+            # If DB row missing, skip image but still show text below
+            continue
+
+        _keycode, _name, image_path, image_url, _fid, *_rgb = row
+        try:
+            img_bytes = await load_card_image_bytes(image_path, image_url)
+        except Exception as e:
+            logger.warning("Failed to load image for %s: %s", k, e)
+            continue
+
+        media.append(
+            InputMediaPhoto(
+                media=InputFile(io.BytesIO(img_bytes), filename=f"{k}.jpg"),
+                caption=caption,
+            )
+        )
+        order.append((k, True))
+
+    # Send candidate images (album if possible)
+    try:
+        if len(media) >= 2:
+            msgs = await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+            # Update cache for items uploaded now
+            for msg, (k, uploaded_now) in zip(msgs, order):
+                if uploaded_now and msg.photo:
+                    fid = msg.photo[-1].file_id
+                    await db_set_card_telegram_file_id(db, k, fid)
+        elif len(media) == 1:
+            m = media[0]
+            # If it's a cached file_id, send_photo still works and is simplest
+            sent = await context.bot.send_photo(chat_id=update.effective_chat.id, photo=m.media, caption=m.caption)
+            # Cache if we uploaded bytes (InputFile)
+            k, uploaded_now = order[0]
+            if uploaded_now and sent.photo:
+                await db_set_card_telegram_file_id(db, k, sent.photo[-1].file_id)
+    except TelegramError as e:
+        logger.warning("Failed to send candidate images: %s", e)
+
+    # Send follow-up message with watch buttons
     lines = ["Top matches:"]
-    for i, (k, score) in enumerate(candidates, 1):
-        if isinstance(score, (int, float)):
-            # display as percent if it looks like a similarity in [0,1]
-            if 0.0 <= float(score) <= 1.0:
-                lines.append(f"{i}. `{k}` ({float(score)*100:.1f}%)")
-            else:
-                lines.append(f"{i}. `{k}` (score: {score})")
-        else:
-            lines.append(f"{i}. `{k}`")
-
-    lines.append("")
-    lines.append("Choose an option below:")
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for i, (k, sim) in enumerate(candidates, start=1):
+        lines.append(f"{i}. `{k}` ({sim*100:.1f}%)")
+        keyboard_rows.append([InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")])
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=keyboard,
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
         parse_mode="Markdown",
     )
 
@@ -184,9 +309,9 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     Group flow:
       - someone posts photo in group
-      - bot calls classifier
-      - bot finds which users watch returned keycodes (SQLite)
-      - bot notifies those users (DM by default); if DM fails, fallback to group mention
+      - bot classifies
+      - bot finds watchers for detected keycodes
+      - bot notifies watchers (DM preferred)
     """
     if not update.message:
         return
@@ -196,24 +321,23 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not chat:
         return
 
-    # Optional: prevent reprocessing same message (simple in-memory dedupe)
-    # Note: for true persistence you can store (chat_id, message_id) in SQLite.
-    processed: Set[Tuple[int, int]] = context.application.bot_data.setdefault("processed_group_msgs", set())
-    marker = (chat.id, msg.message_id)
-    if marker in processed:
-        return
-    processed.add(marker)
+    db: aiosqlite.Connection = context.application.bot_data["db"]
 
     try:
         image_bytes = await download_best_photo_bytes(update, context)
     except Exception as e:
         logger.exception("Failed to download group photo: %s", e)
-        return  # silently ignore in group to reduce noise
+        return
 
     try:
-        raw_keycodes = await classify_image(image_bytes)
-        keycodes = [normalize_keycode(k) for k in raw_keycodes if k and k.strip()]
-        keycodes = list(dict.fromkeys(keycodes))  # dedupe preserve order
+        ranked = await classify_image(db, context, image_bytes, top_k=3)
+        keycodes = []
+        seen = set()
+        for k, _sim in ranked:
+            kk = normalize_keycode(k)
+            if kk and kk not in seen:
+                seen.add(kk)
+                keycodes.append(kk)
     except Exception as e:
         logger.exception("Classifier failed for group photo: %s", e)
         return
@@ -221,9 +345,7 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not keycodes:
         return
 
-    db: aiosqlite.Connection = context.application.bot_data["db"]
     watchers_by_code = await watchers_for_keycodes(db, keycodes)
-
     if not watchers_by_code:
         return
 
@@ -233,11 +355,9 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for uid in user_ids:
             user_hits.setdefault(uid, []).append(code)
 
-    # Notification message: include link-ish context (group name + message id)
     group_name = chat.title or "this group"
     notif_base = f"Watched card detected in {group_name}."
 
-    # Try DM first; if blocked / not started, fallback in group with mention
     for user_id, codes in user_hits.items():
         codes = list(dict.fromkeys(codes))
         dm_text = notif_base + "\n" + "Matched keycode(s): " + ", ".join(codes)
@@ -246,17 +366,13 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             await context.bot.send_message(chat_id=user_id, text=dm_text)
             dm_sent = True
-        except Forbidden:
-            dm_sent = False
-        except BadRequest:
+        except (Forbidden, BadRequest):
             dm_sent = False
         except TelegramError as e:
             logger.warning("DM to %s failed: %s", user_id, e)
             dm_sent = False
 
         if not dm_sent:
-            # Fallback in group: mention user_id (works even if not username)
-            # Note: This may not notify if user has privacy settings; but it's a reasonable fallback.
             group_text = f"[User](tg://user?id={user_id}) watched card detected. Keycode(s): {', '.join(codes)}"
             try:
                 await context.bot.send_message(

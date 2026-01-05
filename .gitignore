@@ -12,3 +12,6 @@ wheels/
 
 # Environment variables file
 .env
+
+# Image files
+seed_images/
