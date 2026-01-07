@@ -28,14 +28,32 @@ import urllib.request
 from pathlib import Path
 from PIL import Image, ImageStat
 
+import logging
 
-DB_PATH = os.getenv("SQLITE_PATH", "bot.db")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+
+# Silence noisy dependencies that leak or spam
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# (optional but recommended)
+logging.getLogger("telegram").setLevel(logging.INFO)
+
+
+logger = logging.getLogger(__name__)
+logger.info("Logging is working")
 
 load_dotenv()
+DB_PATH = os.getenv("SQLITE_PATH", "bot.db")
+logger.info("Using DB_PATH=%s", DB_PATH)
 TOKEN: Final = os.environ["BOT_TOKEN"]
 BOT_USERNAME: Final = '@Pokemon_Card_tracker_bot'
 
-logger = logging.getLogger(__name__)
 
 # Helpers
 def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -186,22 +204,13 @@ async def download_best_photo_bytes(update: Update, context: ContextTypes.DEFAUL
     await tg_file.download_to_memory(out=bio)
     return bio.getvalue()
 
-# Private photo handler
 async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    DM flow:
-      - user sends photo to bot privately
-      - bot classifies
-      - bot sends top-3 candidate images:
-          - uses telegram_file_id if cached
-          - otherwise loads from image_path/image_url, uploads once, then stores telegram_file_id
-      - bot replies with keycodes + inline watch buttons
-    """
     if not update.message:
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
+    # 1) Download user image
     try:
         image_bytes = await download_best_photo_bytes(update, context)
     except Exception as e:
@@ -209,15 +218,15 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("I couldn't download that image. Please try again.")
         return
 
-    # Classify
+    # 2) Classify
     try:
-        ranked = await classify_image(db, context, image_bytes, top_k=3)  # [(keycode, sim), ...]
+        ranked = await classify_image(db, context, image_bytes, top_k=3)
     except Exception as e:
-        logger.exception("Classifier failed for DM photo: %s", e)
+        logger.exception("Classifier failed: %s", e)
         await update.message.reply_text("Classification failed. Please try again.")
         return
 
-    # Normalize + unique
+    # 3) Normalize + unique
     candidates: list[tuple[str, float]] = []
     seen: set[str] = set()
     for keycode, sim in ranked:
@@ -225,122 +234,134 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         if k and k not in seen:
             seen.add(k)
             candidates.append((k, float(sim)))
-        if len(candidates) >= 3:
+        if len(candidates) == 3:
             break
 
     if not candidates:
-        await update.message.reply_text("No matches found (or your card catalog is empty).")
+        await update.message.reply_text("No matches found.")
         return
 
     keycodes = [k for k, _ in candidates]
     cards = await db_get_cards_by_keycodes(db, keycodes)
 
-    # Build media group (mix cached file_ids and new uploads)
-    media: list[InputMediaPhoto] = []
-    order: list[tuple[str, bool]] = []  # (keycode, uploaded_now?)
+    def looks_like_telegram_file_id(s: str | None) -> bool:
+        if not s:
+            return False
+        s = s.strip()
+        return (len(s) > 20) and ("://" not in s) and ("/" not in s)
+
+    # 4) Build upload tasks
+    upload_tasks: list[tuple[str, str, object, bool]] = []
+    open_files: list[object] = []
 
     for idx, (k, sim) in enumerate(candidates, start=1):
         row = cards.get(k)
-        caption = f"{idx}. {k} ({sim*100:.1f}%)"
-        if row and row[1]:
-            caption += f"\n{row[1]}"
-
-        if row and row[4]:  # telegram_file_id
-            media.append(InputMediaPhoto(media=row[4], caption=caption))
-            order.append((k, False))
-            continue
-
-        # Not cached yet => load from authoritative source and upload now
         if not row:
-            # If DB row missing, skip image but still show text below
             continue
 
-        _keycode, _name, image_path, image_url, _fid, *_rgb = row
-        try:
-            img_bytes = await load_card_image_bytes(image_path, image_url)
-        except Exception as e:
-            logger.warning("Failed to load image for %s: %s", k, e)
+        _, name, image_path, image_url, telegram_file_id, *_ = row
+
+        caption = f"{idx}. {k} ({sim*100:.1f}%)"
+        if name:
+            caption += f"\n{name}"
+
+        if looks_like_telegram_file_id(telegram_file_id):
+            upload_tasks.append((k, caption, telegram_file_id, False))
             continue
 
-        media.append(
-            InputMediaPhoto(
-                media=InputFile(io.BytesIO(img_bytes), filename=f"{k}.jpg"),
+        if image_path and str(image_path).strip():
+            p = Path(str(image_path).strip()).expanduser()
+            if p.is_file():
+                f = p.open("rb")
+                open_files.append(f)
+                upload_tasks.append((k, caption, InputFile(f, filename=p.name), True))
+                continue
+
+        if image_url and str(image_url).strip():
+            upload_tasks.append((k, caption, image_url, True))
+            continue
+
+    # 5) Phase A — upload individually (always works)
+    sent_file_ids: list[tuple[str, str]] = []
+
+    try:
+        for k, caption, photo_arg, should_cache in upload_tasks:
+            if isinstance(photo_arg, str):
+                sent_file_ids.append((k, photo_arg))
+                continue
+
+            sent = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=photo_arg,
                 caption=caption,
             )
-        )
-        order.append((k, True))
 
-    # Send candidate images (album if possible)
-    try:
-        if len(media) >= 2:
-            msgs = await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
-            # Update cache for items uploaded now
-            for msg, (k, uploaded_now) in zip(msgs, order):
-                if uploaded_now and msg.photo:
-                    fid = msg.photo[-1].file_id
+            if sent.photo:
+                fid = sent.photo[-1].file_id
+                sent_file_ids.append((k, fid))
+                if should_cache:
                     await db_set_card_telegram_file_id(db, k, fid)
-        elif len(media) == 1:
-            m = media[0]
-            # If it's a cached file_id, send_photo still works and is simplest
-            sent = await context.bot.send_photo(chat_id=update.effective_chat.id, photo=m.media, caption=m.caption)
-            # Cache if we uploaded bytes (InputFile)
-            k, uploaded_now = order[0]
-            if uploaded_now and sent.photo:
-                await db_set_card_telegram_file_id(db, k, sent.photo[-1].file_id)
-    except TelegramError as e:
-        logger.warning("Failed to send candidate images: %s", e)
 
-    # Send follow-up message with watch buttons
+    finally:
+        for f in open_files:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    # 6) Phase B — resend as media group (file_ids only, safe)
+    # if len(sent_file_ids) >= 2:
+    #    media = [InputMediaPhoto(media=fid) for _, fid in sent_file_ids]
+    #    await context.bot.send_media_group(
+    #        chat_id=update.effective_chat.id,
+    #        media=media,
+    #     )
+
+    # 7) Send text + watch buttons
     lines = ["Top matches:"]
-    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    keyboard: list[list[InlineKeyboardButton]] = []
+
     for i, (k, sim) in enumerate(candidates, start=1):
         lines.append(f"{i}. `{k}` ({sim*100:.1f}%)")
-        keyboard_rows.append([InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")])
+        keyboard.append(
+            [InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")]
+        )
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
 
 # Group photo handler
 
 async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Group flow:
-      - someone posts photo in group
-      - bot classifies
-      - bot finds watchers for detected keycodes
-      - bot notifies watchers (DM preferred)
-    """
-    if not update.message:
-        return
-
-    chat = update.effective_chat
-    msg = update.message
-    if not chat:
+    if not update.message or not update.effective_chat:
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
+    # Download image
     try:
         image_bytes = await download_best_photo_bytes(update, context)
     except Exception as e:
         logger.exception("Failed to download group photo: %s", e)
         return
 
+    # Classify
     try:
         ranked = await classify_image(db, context, image_bytes, top_k=3)
-        keycodes = []
-        seen = set()
-        for k, _sim in ranked:
-            kk = normalize_keycode(k)
-            if kk and kk not in seen:
-                seen.add(kk)
-                keycodes.append(kk)
     except Exception as e:
-        logger.exception("Classifier failed for group photo: %s", e)
+        logger.exception("Classifier failed: %s", e)
         return
+
+    keycodes: list[str] = []
+    seen: set[str] = set()
+    for k, _ in ranked:
+        kk = normalize_keycode(k)
+        if kk and kk not in seen:
+            seen.add(kk)
+            keycodes.append(kk)
 
     if not keycodes:
         return
@@ -349,40 +370,18 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not watchers_by_code:
         return
 
-    # Build per-user list of matches
-    user_hits: Dict[int, List[str]] = {}
-    for code, user_ids in watchers_by_code.items():
-        for uid in user_ids:
-            user_hits.setdefault(uid, []).append(code)
+    # Notify watchers
+    chat_name = update.effective_chat.title or "this group"
 
-    group_name = chat.title or "this group"
-    notif_base = f"Watched card detected in {group_name}."
-
-    for user_id, codes in user_hits.items():
-        codes = list(dict.fromkeys(codes))
-        dm_text = notif_base + "\n" + "Matched keycode(s): " + ", ".join(codes)
-
-        dm_sent = False
-        try:
-            await context.bot.send_message(chat_id=user_id, text=dm_text)
-            dm_sent = True
-        except (Forbidden, BadRequest):
-            dm_sent = False
-        except TelegramError as e:
-            logger.warning("DM to %s failed: %s", user_id, e)
-            dm_sent = False
-
-        if not dm_sent:
-            group_text = f"[User](tg://user?id={user_id}) watched card detected. Keycode(s): {', '.join(codes)}"
+    for keycode, user_ids in watchers_by_code.items():
+        for user_id in user_ids:
             try:
                 await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=group_text,
-                    parse_mode="Markdown",
-                    reply_to_message_id=msg.message_id,
+                    chat_id=user_id,
+                    text=f"Watched card detected in {chat_name}: {keycode}",
                 )
-            except TelegramError as e:
-                logger.warning("Group fallback notify failed: %s", e)
+            except TelegramError:
+                pass
 
 # Callback handler for inline buttons
 async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -748,7 +747,7 @@ if __name__ == '__main__':
     
 
     # init sqlite and store handle
-    app = Application.builder().token(TOKEN).post_init(post_init).build()   
+    app = Application.builder().token(TOKEN).local_mode(False).post_init(post_init).build()   
     # Commands
     app.add_handler(CommandHandler('start', start_command))
     app.add_handler(CommandHandler('help', help_command))

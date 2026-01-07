@@ -94,7 +94,7 @@ async def seed(
                 db,
                 keycode=keycode,
                 name=name,
-                image_path=str(img_path),
+                image_path=str(img_path.resolve()),
                 avg_r=float(r),
                 avg_g=float(g),
                 avg_b=float(b),
