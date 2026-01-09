@@ -3,6 +3,7 @@ import io
 import asyncio
 import tempfile
 import logging
+import time
 from dotenv import load_dotenv
 from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
 from telegram import (
@@ -53,7 +54,7 @@ TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
 
 TEL_CROPPER_MODEL_PATH = str(Path("vision") / "tel_cropper" / "weights" / "best.pt")
 
-WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.90"))  # tune later
+WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.70"))  # tune later
 TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
 TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
 TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
@@ -69,7 +70,6 @@ EMBED_TF = transforms.Compose([
 ])
 
 
-import logging
 
 
 logging.basicConfig(
@@ -715,7 +715,7 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     imgsz = int(context.application.bot_data.get("tel_cropper_imgsz", 960))
     pad = float(context.application.bot_data.get("tel_cropper_pad", 0.01))
     max_crops = int(context.application.bot_data.get("tel_cropper_max_crops", 6))
-    threshold = float(context.application.bot_data.get("watch_sim_threshold", 0.90))
+    threshold = float(context.application.bot_data.get("watch_sim_threshold", 0.75))
 
     # 1) Crop telegram image (blocking -> thread)
     try:
@@ -779,8 +779,17 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg_id = update.message.message_id
     chat_id = chat.id
 
-    notified_triplets: set[tuple[int, int, int]] = context.application.bot_data.setdefault("notified_triplets", set())
+    now = time.time()
+    notified_triplets: dict[tuple[int, int, int], float] = context.application.bot_data.setdefault("notified_triplets", {})
+    ttl = int(context.application.bot_data.get("notified_ttl_seconds", 3600))
+    prune_every = int(context.application.bot_data.get("notified_prune_every", 5000))
 
+    # Prune only when structure is "large enough" (cheap amortized maintenance)
+    if len(notified_triplets) > prune_every:
+        cutoff = now - ttl
+        for k, ts in list(notified_triplets.items()):
+            if ts < cutoff:
+                del notified_triplets[k]
     # 4) Compare per user and notify at most once per message
     for user_id, d in proto_cache.items():
         triplet = (chat_id, msg_id, int(user_id))
@@ -812,7 +821,8 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
             continue
 
         # Mark de-dup before sending to avoid double-notifies on retry
-        notified_triplets.add(triplet)
+        notified_triplets[triplet] = now
+
 
         caption = (
             f"Match found in group: {group_title}\n"
@@ -1319,8 +1329,13 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 async def post_init(app: Application):
+    # ---- Init DB ----
     db = await init_db(DB_PATH)
     app.bot_data["db"] = db
+    # initialize notified triplets storage
+    app.bot_data["notified_triplets"] = {}  # (chat_id, msg_id, user_id) -> unix_ts
+    app.bot_data["notified_prune_every"] = 5000
+    app.bot_data["notified_ttl_seconds"] = 3600  # 1 hour
 
     # ---- Load encoder ----
     device = torch.device("cpu")
@@ -1341,8 +1356,6 @@ async def post_init(app: Application):
     app.bot_data["proto_cache_dirty"] = True
     app.bot_data["proto_cache"] = {}  # filled on first use
 
-    # de-dup notifications: (chat_id, message_id, user_id)
-    app.bot_data["notified_triplets"] = set()
 
 
     # ---- Load card embeddings into memory ----
