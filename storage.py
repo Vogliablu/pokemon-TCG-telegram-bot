@@ -310,3 +310,21 @@ async def delete_user_prototype_by_nickname(
         return None
 
     return image_path
+
+async def set_user_prototype_threshold(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+    nickname: str,
+    threshold: float,
+) -> int:
+    cur = await db.execute(
+        """
+        UPDATE user_prototypes
+        SET threshold = ?
+        WHERE owner_user_id = ? AND nickname = ?
+        """,
+        (float(threshold), int(owner_user_id), nickname),
+    )
+    await db.commit()
+    return int(cur.rowcount or 0)

@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS user_prototypes (
   embedding_norm   INTEGER NOT NULL DEFAULT 1,
   embedding_model  TEXT,
 
+  threshold REAL NOT NULL DEFAULT 0.70,
+
   created_at       TEXT NOT NULL DEFAULT (datetime('now')),
 
   UNIQUE(owner_user_id, nickname),
@@ -207,10 +209,35 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+import aiosqlite
+
+async def _column_exists(db: aiosqlite.Connection, table: str, column: str) -> bool:
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    rows = await cur.fetchall()
+    return any(r[1] == column for r in rows)  # r[1] is column name
+
+
+async def migrate_add_user_prototypes_threshold(db: aiosqlite.Connection) -> None:
+    # Add threshold column if missing
+    if not await _column_exists(db, "user_prototypes", "threshold"):
+        await db.execute(
+            "ALTER TABLE user_prototypes ADD COLUMN threshold REAL NOT NULL DEFAULT 0.70"
+        )
+        await db.commit()
+
+    # Optional: index (safe to run every time)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_prototypes_owner_threshold "
+        "ON user_prototypes(owner_user_id, threshold)"
+    )
+    await db.commit()
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(db_path, timeout=30)
     await db.execute("PRAGMA foreign_keys = ON;")
     await db.execute("PRAGMA journal_mode = WAL;")
     await db.executescript(SCHEMA)
     await _migrate(db)
+    await migrate_add_user_prototypes_threshold(db)
     return db

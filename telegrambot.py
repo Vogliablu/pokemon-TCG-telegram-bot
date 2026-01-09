@@ -29,7 +29,8 @@ from storage import (
     get_latest_pending_prototype,
     delete_pending_prototype,
     create_user_prototype_from_pending,
-    delete_user_prototype_by_nickname
+    delete_user_prototype_by_nickname,
+    set_user_prototype_threshold,
 )
 import uuid
 import asyncio
@@ -355,12 +356,13 @@ async def rebuild_user_prototypes_cache(db: aiosqlite.Connection) -> dict[int, d
       cache[user_id] = {
         "ids": [int,...],
         "nicks": [str,...],
-        "mat": np.ndarray shape (M, 512) float32 L2-normalized
+        "mat": np.ndarray shape (M, 512) float32 L2-normalized,
+        "ths": [float,...]
       }
     """
     cur = await db.execute(
         """
-        SELECT id, owner_user_id, nickname, embedding
+        SELECT id, owner_user_id, nickname, threshold, embedding
         FROM user_prototypes
         WHERE embedding IS NOT NULL
         """
@@ -368,22 +370,24 @@ async def rebuild_user_prototypes_cache(db: aiosqlite.Connection) -> dict[int, d
     rows = await cur.fetchall()
 
     tmp: dict[int, dict[str, list]] = {}
-    for proto_id, owner_user_id, nickname, emb_blob in rows:
+    for proto_id, owner_user_id, nickname, threshold, emb_blob in rows:
         uid = int(owner_user_id)
         v = np.frombuffer(emb_blob, dtype=np.float32)
         if v.shape[0] != 512:
             continue
-        d = tmp.setdefault(uid, {"ids": [], "nicks": [], "vecs": []})
+        d = tmp.setdefault(uid, {"ids": [], "nicks": [], "ths": [], "vecs": []})
         d["ids"].append(int(proto_id))
         d["nicks"].append(str(nickname))
+        d["ths"].append(float(threshold) if threshold is not None else 0.70)
         d["vecs"].append(v)
 
     cache: dict[int, dict[str, object]] = {}
     for uid, d in tmp.items():
         mat = np.vstack(d["vecs"]).astype(np.float32, copy=False)
-        cache[uid] = {"ids": d["ids"], "nicks": d["nicks"], "mat": mat}
-
+        ths = np.array(d["ths"], dtype=np.float32)
+        cache[uid] = {"ids": d["ids"], "nicks": d["nicks"], "ths": ths, "mat": mat}
     return cache
+
 
 
 async def _read_file_bytes(path: str) -> bytes:
@@ -715,7 +719,6 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     imgsz = int(context.application.bot_data.get("tel_cropper_imgsz", 960))
     pad = float(context.application.bot_data.get("tel_cropper_pad", 0.01))
     max_crops = int(context.application.bot_data.get("tel_cropper_max_crops", 6))
-    threshold = float(context.application.bot_data.get("watch_sim_threshold", 0.75))
 
     # 1) Crop telegram image (blocking -> thread)
     try:
@@ -796,29 +799,38 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if triplet in notified_triplets:
             continue
 
-        mat: np.ndarray = d["mat"]  # (M,512)
-        nicks: list[str] = d["nicks"]
+        mat: np.ndarray = d["mat"]          # (M,512)
+        nicks: list[str] = d["nicks"]       # length M
+        ths = d.get("ths")                  # np.ndarray shape (M,) or list length M
+
+        # Safety fallback if cache lacks thresholds
+        if ths is None:
+            ths = np.full((mat.shape[0],), 0.70, dtype=np.float32)
+        elif not isinstance(ths, np.ndarray):
+            ths = np.array(ths, dtype=np.float32)
 
         best_sim = -1.0
         best_nick = None
         best_crop_bytes = None
+        best_th = None
 
-        # Find best match across all crops (aligned bytes + embedding)
+        # Find best match across crops, but ONLY among prototypes that pass their own threshold
         for cb, v in crop_items:
-            sims = mat @ v  # (M,)
+            sims = mat @ v                  # (M,)
             j = int(np.argmax(sims))
             s = float(sims[j])
-            if s > best_sim:
+            th_j = float(ths[j])
+
+            if s >= th_j and s > best_sim:
                 best_sim = s
                 best_nick = nicks[j]
                 best_crop_bytes = cb
+                best_th = th_j
 
-
+        # If nothing passed its own threshold, do not notify
         if best_nick is None or best_crop_bytes is None:
             continue
 
-        if best_sim < threshold:
-            continue
 
         # Mark de-dup before sending to avoid double-notifies on retry
         notified_triplets[triplet] = now
@@ -827,9 +839,10 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         caption = (
             f"Match found in group: {group_title}\n"
             f"Watched: {best_nick}\n"
-            f"Similarity: {best_sim:.3f}\n"
+            f"Similarity: {best_sim:.3f} (threshold {best_th:.2f})\n"
             f"Posted by: {sender_name}"
         )
+
 
         try:
             bio = io.BytesIO(best_crop_bytes)
@@ -1006,6 +1019,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     '/identify - Send a photo of a card to identify its keycode\n'
     '/watchlist - Show your current watchlist\n'
     '/clearwatchlist - Remove all cards from your watchlist (DM only)\n'
+    '/setthreshold <nickname> <threshold> - Set similarity threshold for a watched card\n'
     )
 
 async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1209,7 +1223,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # New user-learned watched cards (this is what /watch <nickname> creates)
     cur = await db.execute(
         """
-        SELECT id, nickname, created_at
+        SELECT id, nickname, threshold, created_at
         FROM user_prototypes
         WHERE owner_user_id = ?
         ORDER BY created_at DESC
@@ -1231,9 +1245,11 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Your learned cards:")
             max_show = 50
             shown = proto_rows[:max_show]
-            for proto_id, nickname, created_at in shown:
-                # proto_id is useful for future /unwatch-by-id commands
-                lines.append(f"- *{nickname}* (id={proto_id})")
+            for proto_id, nickname, th, created_at in shown:
+            # th can be NULL if you have old rows; fall back to default
+                th_val = float(th) if th is not None else 0.70
+                lines.append(f"- *{nickname}* (id={proto_id}, th={th_val:.2f})")
+
             if len(proto_rows) > max_show:
                 lines.append(f"(+{len(proto_rows) - max_show} more not shown)")
             lines.append("")  # blank line between sections
@@ -1296,6 +1312,50 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
     db: aiosqlite.Connection = context.application.bot_data["db"]
     removed = await db_clear_watchlist(db, user_id)
     await update.message.reply_text(f"Cleared your watchlist. Removed {removed} entr(y/ies).")
+
+async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use /setthreshold in a private chat with me.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/setthreshold <nickname> <value>`\nExample: `/setthreshold charizard 0.86`",
+            parse_mode="Markdown",
+        )
+        return
+
+    nickname = _normalize_nickname(" ".join(context.args[:-1]))
+    val_str = context.args[-1]
+
+    try:
+        th = float(val_str)
+    except ValueError:
+        await update.message.reply_text("Threshold must be a number like 0.86.")
+        return
+
+    if not (0.0 < th < 1.0):
+        await update.message.reply_text("Threshold must be between 0 and 1 (e.g., 0.86).")
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    user_id = update.effective_user.id
+
+    n = await set_user_prototype_threshold(db, owner_user_id=user_id, nickname=nickname, threshold=th)
+    if n == 0:
+        await update.message.reply_text(f"No learned card named `{nickname}` found.", parse_mode="Markdown")
+        return
+
+    # mark cache dirty so group matching sees new threshold
+    context.application.bot_data["proto_cache_dirty"] = True
+
+    await update.message.reply_text(
+        f"Updated threshold for `{nickname}` to {th:.2f}.",
+        parse_mode="Markdown",
+    )
+
 
 
 # Responses
@@ -1393,7 +1453,9 @@ async def post_init(app: Application):
         BotCommand("watch", "Add a card to your watchlist"),
         BotCommand("unwatch", "Remove a card from your watchlist"),
         BotCommand("watchlist", "Show your watchlist"),
-        BotCommand("clearwatchlist", "Remove all cards from your watchlist (DM)")
+        BotCommand("clearwatchlist", "Remove all cards from your watchlist (DM)"),
+        BotCommand("setthreshold", "Set per-card threshold: /setthreshold <nickname> <value>"),
+
 
     ])
 
@@ -1417,6 +1479,8 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("clearwatchlist", clearwatchlist_command))
     app.add_handler(CommandHandler("watch", watch_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("setthreshold", setthreshold_command))
+
 
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
