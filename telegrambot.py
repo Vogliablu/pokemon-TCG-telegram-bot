@@ -1,5 +1,6 @@
 import os
 import io
+import tempfile
 import logging
 from dotenv import load_dotenv
 from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
@@ -27,6 +28,30 @@ import asyncio
 import urllib.request
 from pathlib import Path
 from PIL import Image, ImageStat
+import numpy as np
+import torch
+import torchvision
+import torch.nn as nn
+from torchvision import transforms
+from ultralytics import YOLO
+
+VISION_ROOT = Path(__file__).resolve().parent / "vision"
+
+USER_CROPPER_MODEL_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
+USER_CROPPER_CONF = float(os.getenv("USER_CROPPER_CONF", "0.60"))
+USER_CROPPER_MAX_CROPS = int(os.getenv("USER_CROPPER_MAX_CROPS", "3"))
+ENCODER_PATH = VISION_ROOT / "encoder" / "last.pt"
+USER_CROPPER_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
+TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
+EMBED_TF = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    ),
+])
+
 
 import logging
 
@@ -53,9 +78,104 @@ DB_PATH = os.getenv("SQLITE_PATH", "bot.db")
 logger.info("Using DB_PATH=%s", DB_PATH)
 TOKEN: Final = os.environ["BOT_TOKEN"]
 BOT_USERNAME: Final = '@Pokemon_Card_tracker_bot'
-
+CARD_RATIO_PORTRAIT = 63 / 88
 
 # Helpers
+def _image_looks_like_single_card(img: Image.Image, tol: float = 0.18) -> bool:
+    w, h = img.size
+    if w < 20 or h < 20:
+        return False
+    r = w / h
+    rp = CARD_RATIO_PORTRAIT
+    rl = 1.0 / rp
+    return (abs(r - rp) <= tol) or (abs(r - rl) <= tol)
+
+def _clamp_int(v: float, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(v)))
+
+def _pil_open_rgb_from_bytes(image_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(image_bytes)).convert("RGBA").convert("RGB")
+
+def _crop_user_cards_obb_to_aabb(
+    *,
+    user_cropper,
+    image_bytes: bytes,
+    conf: float,
+    max_crops: int,
+) -> Tuple[List[bytes], int]:
+    """
+    Returns (crop_bytes_list, total_detections_found).
+
+    Crop logic = crop_user_pictures.py:
+      - detect OBB
+      - convert OBB corners -> AABB via min/max
+      - clamp to image bounds
+      - crop with PIL
+    :contentReference[oaicite:4]{index=4}
+    """
+    img = _pil_open_rgb_from_bytes(image_bytes)
+    w_img, h_img = img.size
+
+    # Run YOLO on a temp file (most robust with ultralytics)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as tmp:
+        img.save(tmp.name, format="JPEG", quality=95)
+        results = user_cropper.predict(source=tmp.name, conf=conf, verbose=False)
+
+    if not results:
+        results = []
+
+    if not results or getattr(results[0], "obb", None) is None or len(results[0].obb) == 0:
+        # Optional fallback: if photo is basically a scan, treat whole image as one "crop"
+        if _image_looks_like_single_card(img):
+            bio = io.BytesIO()
+            img.save(bio, format="PNG")
+            return [bio.getvalue()], 0
+        return [], 0
+
+    r0 = results[0]
+    total = len(r0.obb)
+
+    corners = r0.obb.xyxyxyxy.cpu().numpy()  # (N, 4, 2) :contentReference[oaicite:5]{index=5}
+
+    # Optional: also use conf if present
+    confs = None
+    if hasattr(r0.obb, "conf") and r0.obb.conf is not None:
+        confs = r0.obb.conf.cpu().numpy().astype(np.float32)
+
+    dets = []
+    for i, c in enumerate(corners):
+        x_min = float(np.min(c[:, 0]))
+        x_max = float(np.max(c[:, 0]))
+        y_min = float(np.min(c[:, 1]))
+        y_max = float(np.max(c[:, 1]))
+
+        x1 = _clamp_int(x_min, 0, w_img - 1)
+        y1 = _clamp_int(y_min, 0, h_img - 1)
+        x2 = _clamp_int(x_max, x1 + 1, w_img)
+        y2 = _clamp_int(y_max, y1 + 1, h_img)
+
+        area = (x2 - x1) * (y2 - y1)
+        det_conf = float(confs[i]) if confs is not None else 1.0
+        dets.append((det_conf, area, (x1, y1, x2, y2)))
+
+    # Sort by confidence then area (descending)
+    dets.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+    if max_crops > 0:
+        dets = dets[:max_crops]
+
+    crop_bytes_list: List[bytes] = []
+    for det_conf, area, (x1, y1, x2, y2) in dets:
+        crop = img.crop((x1, y1, x2, y2))
+        # Basic sanity: skip microscopic crops
+        if crop.size[0] < 40 or crop.size[1] < 40:
+            continue
+        bio = io.BytesIO()
+        crop.save(bio, format="PNG")
+        crop_bytes_list.append(bio.getvalue())
+
+    return crop_bytes_list, total
+
 def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(context.user_data.get("pending_nickname_keycode"))
 
@@ -68,6 +188,19 @@ def avg_rgb_from_bytes(image_bytes: bytes) -> tuple[float, float, float]:
         stat = ImageStat.Stat(im)
         r, g, b = stat.mean
         return float(r), float(g), float(b)
+
+def build_resnet18_encoder_from_lastpt(last_pt: Path, device: torch.device) -> nn.Module:
+    ckpt = torch.load(last_pt, map_location=device, weights_only=False)
+    num_classes = int(ckpt["num_classes"])
+
+    model = torchvision.models.resnet18(weights=None)
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    model.load_state_dict(ckpt["model_state"])
+    model.fc = nn.Identity()
+    model.eval().to(device)
+    return model
+
 
 async def _read_file_bytes(path: str) -> bytes:
     p = Path(path)
@@ -107,31 +240,49 @@ async def classify_image(
     db: aiosqlite.Connection,
     context: ContextTypes.DEFAULT_TYPE,
     image_bytes: bytes,
+    *,
     top_k: int = 3,
 ) -> list[tuple[str, float]]:
     """
-    Dummy classifier: nearest average RGB among all cards.
-    Returns [(keycode, similarity_0_1), ...].
+    Embedding-based image classifier.
+
+    Returns:
+        List of (keycode, similarity), sorted by descending similarity.
     """
-    q_r, q_g, q_b = avg_rgb_from_bytes(image_bytes)
-    index = await ensure_card_index(context, db)
-    if not index:
-        return []
 
-    max_dist = (3 * (255.0 ** 2)) ** 0.5
-    scored: list[tuple[str, float]] = []
-    for keycode, r, g, b in index:
-        dr = r - q_r
-        dg = g - q_g
-        dbb = b - q_b
-        dist = (dr * dr + dg * dg + dbb * dbb) ** 0.5
-        sim = 1.0 - (dist / max_dist)
-        if sim < 0.0:
-            sim = 0.0
-        scored.append((keycode, sim))
+    import io
+    import numpy as np
+    import torch
+    from PIL import Image
 
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored[:top_k]
+    encoder = context.application.bot_data["encoder"]
+    device = context.application.bot_data["device"]
+    emb_matrix = context.application.bot_data["emb_matrix"]
+    emb_keycodes = context.application.bot_data["emb_keycodes"]
+
+    # --- bytes → tensor ---
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = im.convert("RGB")
+        x = EMBED_TF(im).unsqueeze(0).to(device)
+
+    # --- embedding ---
+    with torch.no_grad():
+        v = encoder(x).detach().cpu().numpy().astype(np.float32)[0]
+
+    # L2 normalize
+    v /= (np.linalg.norm(v) + 1e-12)
+
+    # --- cosine similarity ---
+    sims = emb_matrix @ v  # shape (N,)
+
+    # --- top-k ---
+    if top_k >= sims.shape[0]:
+        idx = np.argsort(-sims)
+    else:
+        idx = np.argpartition(-sims, top_k)[:top_k]
+        idx = idx[np.argsort(-sims[idx])]
+
+    return [(str(emb_keycodes[i]), float(sims[i])) for i in idx]
 
 
 async def watchers_for_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str]) -> Dict[str, List[int]]:
@@ -205,7 +356,78 @@ async def download_best_photo_bytes(update: Update, context: ContextTypes.DEFAUL
     return bio.getvalue()
 
 async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    """
+DM flow (Step 3: user-card detection + embedding retrieval):
+
+  - User sends a photo to the bot in a private chat.
+  - Bot downloads the image bytes.
+  - Bot runs the user-card YOLO cropper (OBB detection):
+      * Detects one or more Pokémon cards in the image.
+      * Converts oriented bounding boxes (OBB) to axis-aligned crops (AABB).
+      * Keeps the highest-confidence / largest detections (configurable limit).
+      * Falls back to treating the whole image as a single card
+        if no detection is found but the aspect ratio matches a card.
+  - For each resulting crop:
+      * Bot computes a 512-D embedding using the ResNet18 encoder.
+      * Bot retrieves the top-3 most similar cards from the database
+        using cosine similarity (dot product on L2-normalized vectors).
+      * Bot sends the corresponding card images with similarity scores.
+  - Bot sends a summary message and inline “Watch <keycode>” buttons
+    (deduplicated across all crops).
+
+Scope:
+  - This pipeline runs ONLY in private chats.
+  - Group chats are explicitly ignored by this handler.
+
+Requires (loaded once at startup in post_init):
+
+  context.application.bot_data["db"]
+      -> aiosqlite.Connection
+         SQLite database with cards table and stored embeddings.
+
+  context.application.bot_data["encoder"]
+      -> torch.nn.Module
+         ResNet18-based encoder (final fc replaced by Identity),
+         loaded from encoder/last.pt.
+
+  context.application.bot_data["device"]
+      -> torch.device
+         Device used for embedding inference (cpu or cuda).
+
+  context.application.bot_data["emb_matrix"]
+      -> np.ndarray, shape (N, 512), dtype float32
+         L2-normalized embeddings for all cards in the database.
+
+  context.application.bot_data["emb_keycodes"]
+      -> list[str], length N
+         Keycodes aligned with rows of emb_matrix.
+
+  context.application.bot_data["user_cropper"]
+      -> ultralytics.YOLO
+         YOLO model trained for Pokémon card detection in user images
+         (oriented bounding boxes).
+
+  context.application.bot_data["user_cropper_conf"]
+      -> float
+         Confidence threshold for user-card detection.
+
+  context.application.bot_data["user_cropper_max_crops"]
+      -> int
+         Maximum number of card crops processed per image.
+
+Notes:
+  - All embeddings (database and runtime) MUST be produced with the same
+    encoder checkpoint and the same preprocessing (224×224 resize +
+    ImageNet normalization).
+  - Cropping is a prerequisite for reliable similarity; raw full-image
+    embeddings are no longer used in this flow.
+"""
+
+    if not update.message or not update.effective_chat:
+        return
+
+    # Safety: only run this pipeline in private chats
+    if update.effective_chat.type != "private":
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
@@ -218,31 +440,39 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("I couldn't download that image. Please try again.")
         return
 
-    # 2) Classify
+    # 2) Crop using YOLO OBB (Step 3)
+    user_cropper = context.application.bot_data.get("user_cropper")
+    if user_cropper is None:
+        await update.message.reply_text("Cropper model not loaded on the bot. Check post_init().")
+        return
+
+    conf = float(context.application.bot_data.get("user_cropper_conf", 0.60))
+    max_crops = int(context.application.bot_data.get("user_cropper_max_crops", 3))
+
     try:
-        ranked = await classify_image(db, context, image_bytes, top_k=3)
+        # Run blocking cropper off the event loop
+        crop_bytes_list, total_found = await asyncio.to_thread(
+            _crop_user_cards_obb_to_aabb,
+            user_cropper=user_cropper,
+            image_bytes=image_bytes,
+            conf=conf,
+            max_crops=max_crops,
+        )
     except Exception as e:
-        logger.exception("Classifier failed: %s", e)
-        await update.message.reply_text("Classification failed. Please try again.")
+        logger.exception("User cropper failed: %s", e)
+        await update.message.reply_text("I couldn't detect/crop the card in that photo. Please try another one.")
         return
 
-    # 3) Normalize + unique
-    candidates: list[tuple[str, float]] = []
-    seen: set[str] = set()
-    for keycode, sim in ranked:
-        k = normalize_keycode(keycode)
-        if k and k not in seen:
-            seen.add(k)
-            candidates.append((k, float(sim)))
-        if len(candidates) == 3:
-            break
-
-    if not candidates:
-        await update.message.reply_text("No matches found.")
+    if not crop_bytes_list:
+        await update.message.reply_text(
+            "No card detected. Try a clearer photo (less glare, more straight-on, card fills more of the frame)."
+        )
         return
 
-    keycodes = [k for k, _ in candidates]
-    cards = await db_get_cards_by_keycodes(db, keycodes)
+    if total_found > len(crop_bytes_list):
+        await update.message.reply_text(
+            f"I detected {total_found} card(s), but I will process the best {len(crop_bytes_list)} to avoid spamming."
+        )
 
     def looks_like_telegram_file_id(s: str | None) -> bool:
         if not s:
@@ -250,86 +480,114 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         s = s.strip()
         return (len(s) > 20) and ("://" not in s) and ("/" not in s)
 
-    # 4) Build upload tasks
-    upload_tasks: list[tuple[str, str, object, bool]] = []
-    open_files: list[object] = []
+    # 3) For each crop: embedding-based retrieval (Step 2 classifier, but on the crop)
+    # Collect all candidates across crops for a final keyboard.
+    all_keycodes_for_buttons: List[str] = []
+    summary_lines: List[str] = []
 
-    for idx, (k, sim) in enumerate(candidates, start=1):
-        row = cards.get(k)
-        if not row:
+    for crop_idx, crop_bytes in enumerate(crop_bytes_list, start=1):
+        try:
+            ranked = await classify_image(db, context, crop_bytes, top_k=3)
+        except Exception as e:
+            logger.exception("Embedding classifier failed on crop %d: %s", crop_idx, e)
+            summary_lines.append(f"Crop {crop_idx}: classification failed.")
             continue
 
-        _, name, image_path, image_url, telegram_file_id, *_ = row
+        # Normalize + unique
+        candidates: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for keycode, sim in ranked:
+            k = normalize_keycode(keycode)
+            if k and k not in seen:
+                seen.add(k)
+                candidates.append((k, float(sim)))
+            if len(candidates) == 3:
+                break
 
-        caption = f"{idx}. {k} ({sim*100:.1f}%)"
-        if name:
-            caption += f"\n{name}"
-
-        if looks_like_telegram_file_id(telegram_file_id):
-            upload_tasks.append((k, caption, telegram_file_id, False))
+        if not candidates:
+            summary_lines.append(f"Crop {crop_idx}: no matches.")
             continue
 
-        if image_path and str(image_path).strip():
-            p = Path(str(image_path).strip()).expanduser()
-            if p.is_file():
-                f = p.open("rb")
-                open_files.append(f)
-                upload_tasks.append((k, caption, InputFile(f, filename=p.name), True))
+        # Send candidate images for this crop (same mechanism you already use)
+        keycodes = [k for k, _ in candidates]
+        all_keycodes_for_buttons.extend(keycodes)
+
+        cards = await db_get_cards_by_keycodes(db, keycodes)
+
+        upload_tasks: list[tuple[str, str, object, bool]] = []
+        open_files: list[object] = []
+
+        for rank_i, (k, sim) in enumerate(candidates, start=1):
+            row = cards.get(k)
+            if not row:
                 continue
 
-        if image_url and str(image_url).strip():
-            upload_tasks.append((k, caption, image_url, True))
-            continue
+            _, name, image_path, image_url, telegram_file_id, *_ = row
 
-    # 5) Phase A — upload individually (always works)
-    sent_file_ids: list[tuple[str, str]] = []
+            caption = f"Crop {crop_idx} — {rank_i}. {k} ({sim*100:.1f}%)"
+            if name:
+                caption += f"\n{name}"
 
-    try:
-        for k, caption, photo_arg, should_cache in upload_tasks:
-            if isinstance(photo_arg, str):
-                sent_file_ids.append((k, photo_arg))
+            if looks_like_telegram_file_id(telegram_file_id):
+                upload_tasks.append((k, caption, telegram_file_id, False))
                 continue
 
-            sent = await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=photo_arg,
-                caption=caption,
-            )
+            if image_path and str(image_path).strip():
+                p = Path(str(image_path).strip()).expanduser()
+                if p.is_file():
+                    f = p.open("rb")
+                    open_files.append(f)
+                    upload_tasks.append((k, caption, InputFile(f, filename=p.name), True))
+                    continue
 
-            if sent.photo:
-                fid = sent.photo[-1].file_id
-                sent_file_ids.append((k, fid))
-                if should_cache:
+            if image_url and str(image_url).strip():
+                upload_tasks.append((k, caption, image_url, True))
+                continue
+
+        try:
+            for k, caption, photo_arg, should_cache in upload_tasks:
+                sent = await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo_arg,
+                    caption=caption,
+                )
+                if should_cache and sent.photo:
+                    fid = sent.photo[-1].file_id
                     await db_set_card_telegram_file_id(db, k, fid)
+        finally:
+            for f in open_files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
-    finally:
-        for f in open_files:
-            try:
-                f.close()
-            except Exception:
-                pass
-
-    # 6) Phase B — resend as media group (file_ids only, safe)
-    # if len(sent_file_ids) >= 2:
-    #    media = [InputMediaPhoto(media=fid) for _, fid in sent_file_ids]
-    #    await context.bot.send_media_group(
-    #        chat_id=update.effective_chat.id,
-    #        media=media,
-    #     )
-
-    # 7) Send text + watch buttons
-    lines = ["Top matches:"]
-    keyboard: list[list[InlineKeyboardButton]] = []
-
-    for i, (k, sim) in enumerate(candidates, start=1):
-        lines.append(f"{i}. `{k}` ({sim*100:.1f}%)")
-        keyboard.append(
-            [InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")]
+        # Summary for this crop
+        summary_lines.append(
+            "Crop {} top matches:\n{}".format(
+                crop_idx,
+                "\n".join([f"- `{k}` ({sim*100:.1f}%)" for (k, sim) in candidates]),
+            )
         )
 
+    # 4) Final message + watch buttons (dedup)
+    # (keep it compact; Telegram inline keyboards can get unwieldy)
+    dedup_buttons: List[str] = []
+    seen_btn: set[str] = set()
+    for k in all_keycodes_for_buttons:
+        kk = normalize_keycode(k)
+        if kk and kk not in seen_btn:
+            seen_btn.add(kk)
+            dedup_buttons.append(kk)
+
+    if not summary_lines:
+        await update.message.reply_text("No matches found (classifier failed on all crops).")
+        return
+
+    keyboard_rows = [[InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")] for k in dedup_buttons[:8]]
+
     await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "\n\n".join(summary_lines),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
         parse_mode="Markdown",
     )
 
@@ -725,9 +983,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
-async def post_init(application: Application):
-    application.bot_data["db"] = await init_db(DB_PATH)
-    await application.bot.set_my_commands([
+async def post_init(app: Application):
+    db = await init_db(DB_PATH)
+    app.bot_data["db"] = db
+
+    # ---- Load encoder ----
+    device = torch.device("cpu")
+    encoder_path = ENCODER_PATH
+    encoder = build_resnet18_encoder_from_lastpt(encoder_path, device)
+
+    app.bot_data["encoder"] = encoder
+    app.bot_data["device"] = device
+
+    # ---- Load card embeddings into memory ----
+    rows = await db.execute_fetchall(
+        "SELECT keycode, embedding FROM cards WHERE embedding IS NOT NULL"
+    )
+
+    keycodes = []
+    vectors = []
+
+    for keycode, blob in rows:
+        vec = np.frombuffer(blob, dtype=np.float32)
+        if vec.shape[0] != 512:
+            continue
+        keycodes.append(str(keycode))
+        vectors.append(vec)
+
+    if not vectors:
+        raise RuntimeError("No embeddings found in DB. Did you run backfill?")
+
+    mat = np.vstack(vectors)  # shape (N, 512)
+
+    app.bot_data["emb_keycodes"] = keycodes
+    app.bot_data["emb_matrix"] = mat
+
+    print(f"Loaded {len(keycodes)} card embeddings into memory")
+    # Step 3: YOLO user cropper (load once)
+    app.bot_data["user_cropper"] = YOLO(USER_CROPPER_MODEL_PATH)
+    app.bot_data["user_cropper_conf"] = USER_CROPPER_CONF
+    app.bot_data["user_cropper_max_crops"] = USER_CROPPER_MAX_CROPS
+    await app.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("help", "Show help"),
         BotCommand("identify", "Identify a card from a photo (DM only)"),

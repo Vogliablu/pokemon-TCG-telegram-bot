@@ -1,5 +1,9 @@
 import aiosqlite
 
+# We keep avg_r/g/b for backwards compatibility with the current dummy RGB
+# classifier. Embeddings are added as nullable columns and will become the
+# primary feature vector once the bot flow is switched.
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -28,7 +32,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_user_nickname
 Hybrid cards catalog:
 - image_path / image_url: authoritative location for the full dataset (36k)
 - telegram_file_id: lazily filled cache for fast re-sending on Telegram
-- avg_r/g/b: dummy feature vector (swap later for embeddings)
+- avg_r/g/b: legacy dummy feature vector
+- embedding: 512-dim float32 vector stored as raw bytes (typically L2-normalized)
 */
 CREATE TABLE IF NOT EXISTS cards (
   keycode           TEXT PRIMARY KEY,
@@ -39,11 +44,16 @@ CREATE TABLE IF NOT EXISTS cards (
   avg_r             REAL NOT NULL,
   avg_g             REAL NOT NULL,
   avg_b             REAL NOT NULL,
+  embedding         BLOB,
+  embedding_dim     INTEGER,
+  embedding_norm    INTEGER DEFAULT 0,
+  embedding_model   TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_cards_avg_rgb ON cards(avg_r, avg_g, avg_b);
 """
+
 
 async def _migrate(db: aiosqlite.Connection) -> None:
     # ---- watchlist migrations ----
@@ -70,7 +80,7 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         cur = await db.execute("PRAGMA table_info(cards);")
         card_cols = [r[1] for r in await cur.fetchall()]
 
-        # If legacy schema had image_blob, rebuild to hybrid schema.
+        # If legacy schema had image_blob, rebuild to the hybrid schema.
         if "image_blob" in card_cols:
             await db.executescript(
                 """
@@ -85,10 +95,19 @@ async def _migrate(db: aiosqlite.Connection) -> None:
                   avg_r             REAL NOT NULL,
                   avg_g             REAL NOT NULL,
                   avg_b             REAL NOT NULL,
+                  embedding         BLOB,
+                  embedding_dim     INTEGER,
+                  embedding_norm    INTEGER DEFAULT 0,
+                  embedding_model   TEXT,
                   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
                 );
 
-                INSERT INTO cards(keycode, name, image_path, image_url, telegram_file_id, avg_r, avg_g, avg_b, created_at)
+                INSERT INTO cards(
+                  keycode, name, image_path, image_url, telegram_file_id,
+                  avg_r, avg_g, avg_b,
+                  embedding, embedding_dim, embedding_norm, embedding_model,
+                  created_at
+                )
                 SELECT
                   keycode,
                   name,
@@ -98,6 +117,10 @@ async def _migrate(db: aiosqlite.Connection) -> None:
                   avg_r,
                   avg_g,
                   avg_b,
+                  NULL,
+                  NULL,
+                  0,
+                  NULL,
                   created_at
                 FROM cards_old;
 
@@ -107,7 +130,7 @@ async def _migrate(db: aiosqlite.Connection) -> None:
                 """
             )
         else:
-            # Ensure new columns exist (idempotent).
+            # Ensure newer columns exist (idempotent).
             if "image_path" not in card_cols:
                 await db.execute("ALTER TABLE cards ADD COLUMN image_path TEXT;")
             if "image_url" not in card_cols:
@@ -115,11 +138,22 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             if "telegram_file_id" not in card_cols:
                 await db.execute("ALTER TABLE cards ADD COLUMN telegram_file_id TEXT;")
 
+            # Embedding columns (new)
+            if "embedding" not in card_cols:
+                await db.execute("ALTER TABLE cards ADD COLUMN embedding BLOB;")
+            if "embedding_dim" not in card_cols:
+                await db.execute("ALTER TABLE cards ADD COLUMN embedding_dim INTEGER;")
+            if "embedding_norm" not in card_cols:
+                await db.execute("ALTER TABLE cards ADD COLUMN embedding_norm INTEGER DEFAULT 0;")
+            if "embedding_model" not in card_cols:
+                await db.execute("ALTER TABLE cards ADD COLUMN embedding_model TEXT;")
+
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cards_avg_rgb ON cards(avg_r, avg_g, avg_b);"
             )
 
     await db.commit()
+
 
 async def init_db(db_path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(db_path, timeout=30)

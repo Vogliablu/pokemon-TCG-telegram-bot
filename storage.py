@@ -9,7 +9,6 @@ def normalize_keycode(code: str) -> str:
     return code.strip().upper()
 
 def normalize_nickname(nickname: str) -> str:
-    # Case-insensitive nickname matching
     return nickname.strip().lower()
 
 # -----------------
@@ -60,7 +59,6 @@ async def clear_watchlist(db: aiosqlite.Connection, user_id: int) -> int:
     await db.commit()
     return int(cur.rowcount or 0)
 
-# Optional helper used by group flow
 async def watchers_for_keycodes(
     db: aiosqlite.Connection, keycodes: Iterable[str]
 ) -> Dict[str, List[int]]:
@@ -84,8 +82,11 @@ async def watchers_for_keycodes(
 # Hybrid cards catalog
 # -----------------
 
-CardRow = Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], float, float, float]
-# (keycode, name, image_path, image_url, telegram_file_id, avg_r, avg_g, avg_b)
+CardRow = Tuple[
+    str, Optional[str], Optional[str], Optional[str], Optional[str],
+    float, float, float,
+    Optional[bytes], Optional[int], Optional[int], Optional[str],
+]
 
 async def get_card_features(db: aiosqlite.Connection) -> List[Tuple[str, float, float, float]]:
     cur = await db.execute("SELECT keycode, avg_r, avg_g, avg_b FROM cards")
@@ -100,7 +101,10 @@ async def get_cards_by_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str
     placeholders = ",".join("?" for _ in norm)
     cur = await db.execute(
         f"""
-        SELECT keycode, name, image_path, image_url, telegram_file_id, avg_r, avg_g, avg_b
+        SELECT
+          keycode, name, image_path, image_url, telegram_file_id,
+          avg_r, avg_g, avg_b,
+          embedding, embedding_dim, embedding_norm, embedding_model
         FROM cards
         WHERE keycode IN ({placeholders})
         """,
@@ -110,7 +114,14 @@ async def get_cards_by_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str
     out: Dict[str, CardRow] = {}
     for row in rows:
         k = str(row[0])
-        out[k] = (k, row[1], row[2], row[3], row[4], float(row[5]), float(row[6]), float(row[7]))
+        out[k] = (
+            k, row[1], row[2], row[3], row[4],
+            float(row[5]), float(row[6]), float(row[7]),
+            row[8],
+            (int(row[9]) if row[9] is not None else None),
+            (int(row[10]) if row[10] is not None else None),
+            (str(row[11]) if row[11] is not None else None),
+        )
     return out
 
 async def set_card_telegram_file_id(db: aiosqlite.Connection, keycode: str, telegram_file_id: str) -> None:
@@ -120,3 +131,32 @@ async def set_card_telegram_file_id(db: aiosqlite.Connection, keycode: str, tele
         (telegram_file_id, keycode),
     )
     await db.commit()
+
+# -----------------
+# Embeddings (new)
+# -----------------
+
+async def set_card_embedding(
+    db: aiosqlite.Connection,
+    keycode: str,
+    embedding: bytes,
+    *,
+    dim: int = 512,
+    normed: bool = True,
+    model: str | None = None,
+) -> None:
+    keycode = normalize_keycode(keycode)
+    await db.execute(
+        """
+        UPDATE cards
+        SET embedding = ?, embedding_dim = ?, embedding_norm = ?, embedding_model = ?
+        WHERE keycode = ?
+        """,
+        (embedding, int(dim), 1 if normed else 0, model, keycode),
+    )
+    await db.commit()
+
+async def iter_card_embeddings(db: aiosqlite.Connection) -> List[Tuple[str, bytes]]:
+    cur = await db.execute("SELECT keycode, embedding FROM cards WHERE embedding IS NOT NULL")
+    rows = await cur.fetchall()
+    return [(str(k), bytes(emb)) for (k, emb) in rows if emb is not None]
