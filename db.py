@@ -52,6 +52,58 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cards_avg_rgb ON cards(avg_r, avg_g, avg_b);
+
+
+-- ------------------------------------------------------------
+-- User-owned prototypes (watched cards learned from DM uploads)
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS user_prototypes (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_user_id    INTEGER NOT NULL,
+  nickname         TEXT NOT NULL,
+  image_path       TEXT,
+  telegram_file_id TEXT,
+
+  embedding        BLOB NOT NULL,
+  embedding_dim    INTEGER NOT NULL DEFAULT 512,
+  embedding_norm   INTEGER NOT NULL DEFAULT 1,
+  embedding_model  TEXT,
+
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+
+  UNIQUE(owner_user_id, nickname),
+  FOREIGN KEY (owner_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_prototypes_owner
+  ON user_prototypes(owner_user_id);
+
+-- ------------------------------------------------------------
+-- Pending prototypes (DM uploads waiting for /watch <nickname>)
+-- ------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pending_prototypes (
+  token            TEXT PRIMARY KEY,
+  owner_user_id    INTEGER NOT NULL,
+  image_path       TEXT,
+
+  embedding        BLOB NOT NULL,
+  embedding_dim    INTEGER NOT NULL DEFAULT 512,
+  embedding_norm   INTEGER NOT NULL DEFAULT 1,
+  embedding_model  TEXT,
+
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+
+  FOREIGN KEY (owner_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_prototypes_owner
+  ON pending_prototypes(owner_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_pending_prototypes_created_at
+  ON pending_prototypes(created_at);
+
 """
 
 

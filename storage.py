@@ -160,3 +160,153 @@ async def iter_card_embeddings(db: aiosqlite.Connection) -> List[Tuple[str, byte
     cur = await db.execute("SELECT keycode, embedding FROM cards WHERE embedding IS NOT NULL")
     rows = await cur.fetchall()
     return [(str(k), bytes(emb)) for (k, emb) in rows if emb is not None]
+
+
+import aiosqlite
+from typing import Optional, Tuple
+
+# -----------------
+# Pending prototypes
+# -----------------
+
+async def create_pending_prototype(
+    db: aiosqlite.Connection,
+    *,
+    token: str,
+    owner_user_id: int,
+    image_path: str,
+    embedding_blob: bytes,
+    embedding_dim: int = 512,
+    embedding_norm: int = 1,
+    embedding_model: str | None = None,
+) -> None:
+    await db.execute(
+        """
+        INSERT OR REPLACE INTO pending_prototypes(
+          token, owner_user_id, image_path,
+          embedding, embedding_dim, embedding_norm, embedding_model
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            owner_user_id,
+            image_path,
+            embedding_blob,
+            int(embedding_dim),
+            int(embedding_norm),
+            embedding_model,
+        ),
+    )
+    await db.commit()
+
+
+async def get_latest_pending_prototype(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+) -> Optional[Tuple[str, str, bytes, int, int, Optional[str]]]:
+    """
+    Returns (token, image_path, embedding_blob, embedding_dim, embedding_norm, embedding_model)
+    """
+    cur = await db.execute(
+        """
+        SELECT token, image_path, embedding, embedding_dim, embedding_norm, embedding_model
+        FROM pending_prototypes
+        WHERE owner_user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (int(owner_user_id),),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    token, image_path, emb, dim, norm, model = row
+    return (str(token), str(image_path) if image_path else "", bytes(emb), int(dim), int(norm), str(model) if model else None)
+
+
+async def delete_pending_prototype(
+    db: aiosqlite.Connection,
+    *,
+    token: str,
+    owner_user_id: int,
+) -> int:
+    cur = await db.execute(
+        "DELETE FROM pending_prototypes WHERE token = ? AND owner_user_id = ?",
+        (token, int(owner_user_id)),
+    )
+    await db.commit()
+    return int(cur.rowcount or 0)
+
+# -----------------
+# User prototypes (persistent)
+# -----------------
+
+async def create_user_prototype_from_pending(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+    nickname: str,
+    image_path: str,
+    embedding_blob: bytes,
+    embedding_dim: int = 512,
+    embedding_norm: int = 1,
+    embedding_model: str | None = None,
+) -> int:
+    """
+    Inserts into user_prototypes. Returns new prototype id.
+    Raises sqlite constraint error if nickname already exists for the user.
+    """
+    cur = await db.execute(
+        """
+        INSERT INTO user_prototypes(
+          owner_user_id, nickname, image_path,
+          embedding, embedding_dim, embedding_norm, embedding_model
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(owner_user_id),
+            nickname,
+            image_path,
+            embedding_blob,
+            int(embedding_dim),
+            int(embedding_norm),
+            embedding_model,
+        ),
+    )
+    await db.commit()
+    return int(cur.lastrowid)
+
+from pathlib import Path
+from typing import Optional, Tuple
+
+async def delete_user_prototype_by_nickname(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+    nickname: str,
+) -> Optional[str]:
+    """
+    Deletes a user_prototypes row by (owner_user_id, nickname).
+    Returns image_path if deleted, else None.
+    """
+    cur = await db.execute(
+        "SELECT image_path FROM user_prototypes WHERE owner_user_id = ? AND nickname = ?",
+        (int(owner_user_id), nickname),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+
+    image_path = str(row[0]) if row[0] else ""
+
+    cur = await db.execute(
+        "DELETE FROM user_prototypes WHERE owner_user_id = ? AND nickname = ?",
+        (int(owner_user_id), nickname),
+    )
+    await db.commit()
+
+    if (cur.rowcount or 0) <= 0:
+        return None
+
+    return image_path

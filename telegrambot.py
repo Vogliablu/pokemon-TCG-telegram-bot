@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import tempfile
 import logging
 from dotenv import load_dotenv
@@ -22,8 +23,14 @@ from storage import (
     get_card_features as db_get_card_features,
     get_cards_by_keycodes as db_get_cards_by_keycodes,
     set_card_telegram_file_id as db_set_card_telegram_file_id,
+    ensure_user,
+    create_pending_prototype,
+    get_latest_pending_prototype,
+    delete_pending_prototype,
+    create_user_prototype_from_pending,
+    delete_user_prototype_by_nickname
 )
-
+import uuid
 import asyncio
 import urllib.request
 from pathlib import Path
@@ -36,13 +43,22 @@ from torchvision import transforms
 from ultralytics import YOLO
 
 VISION_ROOT = Path(__file__).resolve().parent / "vision"
-
+USER_UPLOADS_DIR = Path("data/user_uploads")  # keep out of git
 USER_CROPPER_MODEL_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
 USER_CROPPER_CONF = float(os.getenv("USER_CROPPER_CONF", "0.60"))
 USER_CROPPER_MAX_CROPS = int(os.getenv("USER_CROPPER_MAX_CROPS", "3"))
 ENCODER_PATH = VISION_ROOT / "encoder" / "last.pt"
 USER_CROPPER_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
 TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
+
+TEL_CROPPER_MODEL_PATH = str(Path("vision") / "tel_cropper" / "weights" / "best.pt")
+
+WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.90"))  # tune later
+TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
+TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
+TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
+TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "6"))
+
 EMBED_TF = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -176,6 +192,138 @@ def _crop_user_cards_obb_to_aabb(
 
     return crop_bytes_list, total
 
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def _image_looks_like_single_card(img: Image.Image, tol: float = 0.18) -> bool:
+    w, h = img.size
+    if w < 20 or h < 20:
+        return False
+    r = w / h
+    rp = CARD_RATIO_PORTRAIT
+    rl = 1.0 / rp
+    return (abs(r - rp) <= tol) or (abs(r - rl) <= tol)
+
+def _expand_box_to_aspect(xyxy, img_w: int, img_h: int, ratio_portrait: float = CARD_RATIO_PORTRAIT):
+    x1, y1, x2, y2 = map(float, xyxy)
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    cur = bw / bh
+    rp = ratio_portrait
+    rl = 1.0 / rp
+    target = rp if abs(cur - rp) <= abs(cur - rl) else rl
+
+    # Expand (never shrink) to reach target ratio
+    desired_w, desired_h = bw, bh
+    if cur < target:
+        desired_w = max(bw, bh * target)
+    else:
+        desired_h = max(bh, bw / target)
+
+    nx1 = cx - desired_w / 2.0
+    nx2 = cx + desired_w / 2.0
+    ny1 = cy - desired_h / 2.0
+    ny2 = cy + desired_h / 2.0
+
+    nx1 = _clamp(nx1, 0.0, img_w - 2.0)
+    ny1 = _clamp(ny1, 0.0, img_h - 2.0)
+    nx2 = _clamp(nx2, nx1 + 1.0, float(img_w))
+    ny2 = _clamp(ny2, ny1 + 1.0, float(img_h))
+    return [nx1, ny1, nx2, ny2]
+
+def _crop_with_pad(img: Image.Image, xyxy, pad_frac: float) -> Image.Image:
+    w, h = img.size
+    x1, y1, x2, y2 = map(float, xyxy)
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    px = pad_frac * bw
+    py = pad_frac * bh
+    x1 = _clamp(int(round(x1 - px)), 0, w - 1)
+    y1 = _clamp(int(round(y1 - py)), 0, h - 1)
+    x2 = _clamp(int(round(x2 + px)), x1 + 1, w)
+    y2 = _clamp(int(round(y2 + py)), y1 + 1, h)
+    return img.crop((x1, y1, x2, y2))
+
+def _rotate_cw_if_landscape(crop: Image.Image) -> Image.Image:
+    return crop.rotate(-90, expand=True) if crop.width > crop.height else crop
+
+def _rotate_ccw_if_landscape(crop: Image.Image) -> Image.Image:
+    return crop.rotate(90, expand=True) if crop.width > crop.height else crop
+
+def _pil_open_rgb_from_bytes(image_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(image_bytes)).convert("RGBA").convert("RGB")
+
+def crop_telegram_cards_from_bytes(
+    *,
+    tel_cropper,
+    image_bytes: bytes,
+    conf: float,
+    imgsz: int,
+    pad: float,
+    max_crops_per_image: int,
+    aspect_expand: bool = True,
+    scan_fallback: bool = True,
+    rotate_portrait: bool = True,
+) -> list[bytes]:
+    """
+    Returns list of crop PNG bytes.
+    Mirrors crop_telegram_pictures.py behavior (boxes.xyxy + aspect expand + scan fallback + pad + optional dual rotations).
+    """
+    img = _pil_open_rgb_from_bytes(image_bytes)
+    W, H = img.size
+
+    # Ultralytics can accept PIL directly; use that to avoid temp files.
+    results = tel_cropper.predict(source=img, conf=conf, imgsz=imgsz, verbose=False)
+    boxes = results[0].boxes if results else None
+
+    crops: list[bytes] = []
+
+    if boxes is None or len(boxes) == 0:
+        if scan_fallback and _image_looks_like_single_card(img):
+            # Full-scan fallback. If landscape and rotate_portrait, emit both rotations.
+            if rotate_portrait and img.width > img.height:
+                for im2 in (_rotate_cw_if_landscape(img), _rotate_ccw_if_landscape(img)):
+                    bio = io.BytesIO()
+                    im2.save(bio, format="PNG")
+                    crops.append(bio.getvalue())
+            else:
+                bio = io.BytesIO()
+                img.save(bio, format="PNG")
+                crops.append(bio.getvalue())
+        return crops
+
+    xyxy_all = boxes.xyxy.cpu().numpy()
+    conf_all = boxes.conf.cpu().numpy()
+
+    # Sort by confidence desc
+    order = np.argsort(conf_all)[::-1]
+    if max_crops_per_image and max_crops_per_image > 0:
+        order = order[:max_crops_per_image]
+
+    for idx in order.tolist():
+        xyxy = xyxy_all[idx].tolist()
+        if aspect_expand:
+            xyxy = _expand_box_to_aspect(xyxy, W, H, ratio_portrait=CARD_RATIO_PORTRAIT)
+        crop = _crop_with_pad(img, xyxy, pad_frac=pad)
+
+        # If landscape and rotate_portrait enabled -> emit both rotations
+        if rotate_portrait and crop.width > crop.height:
+            for c2 in (_rotate_cw_if_landscape(crop), _rotate_ccw_if_landscape(crop)):
+                bio = io.BytesIO()
+                c2.save(bio, format="PNG")
+                crops.append(bio.getvalue())
+        else:
+            bio = io.BytesIO()
+            crop.save(bio, format="PNG")
+            crops.append(bio.getvalue())
+
+    return crops
+
+
 def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(context.user_data.get("pending_nickname_keycode"))
 
@@ -200,6 +348,42 @@ def build_resnet18_encoder_from_lastpt(last_pt: Path, device: torch.device) -> n
     model.fc = nn.Identity()
     model.eval().to(device)
     return model
+
+async def rebuild_user_prototypes_cache(db: aiosqlite.Connection) -> dict[int, dict[str, object]]:
+    """
+    Returns:
+      cache[user_id] = {
+        "ids": [int,...],
+        "nicks": [str,...],
+        "mat": np.ndarray shape (M, 512) float32 L2-normalized
+      }
+    """
+    cur = await db.execute(
+        """
+        SELECT id, owner_user_id, nickname, embedding
+        FROM user_prototypes
+        WHERE embedding IS NOT NULL
+        """
+    )
+    rows = await cur.fetchall()
+
+    tmp: dict[int, dict[str, list]] = {}
+    for proto_id, owner_user_id, nickname, emb_blob in rows:
+        uid = int(owner_user_id)
+        v = np.frombuffer(emb_blob, dtype=np.float32)
+        if v.shape[0] != 512:
+            continue
+        d = tmp.setdefault(uid, {"ids": [], "nicks": [], "vecs": []})
+        d["ids"].append(int(proto_id))
+        d["nicks"].append(str(nickname))
+        d["vecs"].append(v)
+
+    cache: dict[int, dict[str, object]] = {}
+    for uid, d in tmp.items():
+        mat = np.vstack(d["vecs"]).astype(np.float32, copy=False)
+        cache[uid] = {"ids": d["ids"], "nicks": d["nicks"], "mat": mat}
+
+    return cache
 
 
 async def _read_file_bytes(path: str) -> bytes:
@@ -355,82 +539,31 @@ async def download_best_photo_bytes(update: Update, context: ContextTypes.DEFAUL
     await tg_file.download_to_memory(out=bio)
     return bio.getvalue()
 
+
+@torch.no_grad()
+def compute_embedding_from_png_or_jpg_bytes(
+    image_bytes: bytes,
+    *,
+    encoder: torch.nn.Module,
+    device: torch.device,
+) -> np.ndarray:
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = im.convert("RGB")
+        x = EMBED_TF(im).unsqueeze(0).to(device)
+    v = encoder(x).detach().cpu().numpy().astype(np.float32)[0]  # (512,)
+    v /= (np.linalg.norm(v) + 1e-12)
+    return v
+
 async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-DM flow (Step 3: user-card detection + embedding retrieval):
-
-  - User sends a photo to the bot in a private chat.
-  - Bot downloads the image bytes.
-  - Bot runs the user-card YOLO cropper (OBB detection):
-      * Detects one or more Pokémon cards in the image.
-      * Converts oriented bounding boxes (OBB) to axis-aligned crops (AABB).
-      * Keeps the highest-confidence / largest detections (configurable limit).
-      * Falls back to treating the whole image as a single card
-        if no detection is found but the aspect ratio matches a card.
-  - For each resulting crop:
-      * Bot computes a 512-D embedding using the ResNet18 encoder.
-      * Bot retrieves the top-3 most similar cards from the database
-        using cosine similarity (dot product on L2-normalized vectors).
-      * Bot sends the corresponding card images with similarity scores.
-  - Bot sends a summary message and inline “Watch <keycode>” buttons
-    (deduplicated across all crops).
-
-Scope:
-  - This pipeline runs ONLY in private chats.
-  - Group chats are explicitly ignored by this handler.
-
-Requires (loaded once at startup in post_init):
-
-  context.application.bot_data["db"]
-      -> aiosqlite.Connection
-         SQLite database with cards table and stored embeddings.
-
-  context.application.bot_data["encoder"]
-      -> torch.nn.Module
-         ResNet18-based encoder (final fc replaced by Identity),
-         loaded from encoder/last.pt.
-
-  context.application.bot_data["device"]
-      -> torch.device
-         Device used for embedding inference (cpu or cuda).
-
-  context.application.bot_data["emb_matrix"]
-      -> np.ndarray, shape (N, 512), dtype float32
-         L2-normalized embeddings for all cards in the database.
-
-  context.application.bot_data["emb_keycodes"]
-      -> list[str], length N
-         Keycodes aligned with rows of emb_matrix.
-
-  context.application.bot_data["user_cropper"]
-      -> ultralytics.YOLO
-         YOLO model trained for Pokémon card detection in user images
-         (oriented bounding boxes).
-
-  context.application.bot_data["user_cropper_conf"]
-      -> float
-         Confidence threshold for user-card detection.
-
-  context.application.bot_data["user_cropper_max_crops"]
-      -> int
-         Maximum number of card crops processed per image.
-
-Notes:
-  - All embeddings (database and runtime) MUST be produced with the same
-    encoder checkpoint and the same preprocessing (224×224 resize +
-    ImageNet normalization).
-  - Cropping is a prerequisite for reliable similarity; raw full-image
-    embeddings are no longer used in this flow.
-"""
-
     if not update.message or not update.effective_chat:
         return
-
-    # Safety: only run this pipeline in private chats
     if update.effective_chat.type != "private":
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
+    user_id = update.effective_user.id
+
+    await ensure_user(db, user_id)
 
     # 1) Download user image
     try:
@@ -440,27 +573,33 @@ Notes:
         await update.message.reply_text("I couldn't download that image. Please try again.")
         return
 
-    # 2) Crop using YOLO OBB (Step 3)
+    # 2) Crop using YOLO OBB
     user_cropper = context.application.bot_data.get("user_cropper")
     if user_cropper is None:
-        await update.message.reply_text("Cropper model not loaded on the bot. Check post_init().")
+        await update.message.reply_text("Cropper model not loaded. Check post_init().")
         return
 
     conf = float(context.application.bot_data.get("user_cropper_conf", 0.60))
-    max_crops = int(context.application.bot_data.get("user_cropper_max_crops", 3))
 
     try:
-        # Run blocking cropper off the event loop
+        # IMPORTANT: allow multiple detections so we can enforce "exactly one"
         crop_bytes_list, total_found = await asyncio.to_thread(
             _crop_user_cards_obb_to_aabb,
             user_cropper=user_cropper,
             image_bytes=image_bytes,
             conf=conf,
-            max_crops=max_crops,
+            max_crops=10,   # do not cap at 1 here; we must detect multiplicity
         )
     except Exception as e:
         logger.exception("User cropper failed: %s", e)
         await update.message.reply_text("I couldn't detect/crop the card in that photo. Please try another one.")
+        return
+
+    # 3) Enforce exactly one card
+    if total_found > 1:
+        await update.message.reply_text(
+            f"I detected {total_found} cards in this picture. Please send a photo with one card only."
+        )
         return
 
     if not crop_bytes_list:
@@ -469,177 +608,233 @@ Notes:
         )
         return
 
-    if total_found > len(crop_bytes_list):
-        await update.message.reply_text(
-            f"I detected {total_found} card(s), but I will process the best {len(crop_bytes_list)} to avoid spamming."
+    # At this point we accept exactly one crop
+    crop_bytes = crop_bytes_list[0]
+
+    # 4) Compute embedding
+    try:
+        encoder = context.application.bot_data["encoder"]
+        device = context.application.bot_data["device"]
+        v = await asyncio.to_thread(
+            compute_embedding_from_png_or_jpg_bytes,
+            crop_bytes,
+            encoder=encoder,
+            device=device,
         )
-
-    def looks_like_telegram_file_id(s: str | None) -> bool:
-        if not s:
-            return False
-        s = s.strip()
-        return (len(s) > 20) and ("://" not in s) and ("/" not in s)
-
-    # 3) For each crop: embedding-based retrieval (Step 2 classifier, but on the crop)
-    # Collect all candidates across crops for a final keyboard.
-    all_keycodes_for_buttons: List[str] = []
-    summary_lines: List[str] = []
-
-    for crop_idx, crop_bytes in enumerate(crop_bytes_list, start=1):
-        try:
-            ranked = await classify_image(db, context, crop_bytes, top_k=3)
-        except Exception as e:
-            logger.exception("Embedding classifier failed on crop %d: %s", crop_idx, e)
-            summary_lines.append(f"Crop {crop_idx}: classification failed.")
-            continue
-
-        # Normalize + unique
-        candidates: list[tuple[str, float]] = []
-        seen: set[str] = set()
-        for keycode, sim in ranked:
-            k = normalize_keycode(keycode)
-            if k and k not in seen:
-                seen.add(k)
-                candidates.append((k, float(sim)))
-            if len(candidates) == 3:
-                break
-
-        if not candidates:
-            summary_lines.append(f"Crop {crop_idx}: no matches.")
-            continue
-
-        # Send candidate images for this crop (same mechanism you already use)
-        keycodes = [k for k, _ in candidates]
-        all_keycodes_for_buttons.extend(keycodes)
-
-        cards = await db_get_cards_by_keycodes(db, keycodes)
-
-        upload_tasks: list[tuple[str, str, object, bool]] = []
-        open_files: list[object] = []
-
-        for rank_i, (k, sim) in enumerate(candidates, start=1):
-            row = cards.get(k)
-            if not row:
-                continue
-
-            _, name, image_path, image_url, telegram_file_id, *_ = row
-
-            caption = f"Crop {crop_idx} — {rank_i}. {k} ({sim*100:.1f}%)"
-            if name:
-                caption += f"\n{name}"
-
-            if looks_like_telegram_file_id(telegram_file_id):
-                upload_tasks.append((k, caption, telegram_file_id, False))
-                continue
-
-            if image_path and str(image_path).strip():
-                p = Path(str(image_path).strip()).expanduser()
-                if p.is_file():
-                    f = p.open("rb")
-                    open_files.append(f)
-                    upload_tasks.append((k, caption, InputFile(f, filename=p.name), True))
-                    continue
-
-            if image_url and str(image_url).strip():
-                upload_tasks.append((k, caption, image_url, True))
-                continue
-
-        try:
-            for k, caption, photo_arg, should_cache in upload_tasks:
-                sent = await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=photo_arg,
-                    caption=caption,
-                )
-                if should_cache and sent.photo:
-                    fid = sent.photo[-1].file_id
-                    await db_set_card_telegram_file_id(db, k, fid)
-        finally:
-            for f in open_files:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-
-        # Summary for this crop
-        summary_lines.append(
-            "Crop {} top matches:\n{}".format(
-                crop_idx,
-                "\n".join([f"- `{k}` ({sim*100:.1f}%)" for (k, sim) in candidates]),
-            )
-        )
-
-    # 4) Final message + watch buttons (dedup)
-    # (keep it compact; Telegram inline keyboards can get unwieldy)
-    dedup_buttons: List[str] = []
-    seen_btn: set[str] = set()
-    for k in all_keycodes_for_buttons:
-        kk = normalize_keycode(k)
-        if kk and kk not in seen_btn:
-            seen_btn.add(kk)
-            dedup_buttons.append(kk)
-
-    if not summary_lines:
-        await update.message.reply_text("No matches found (classifier failed on all crops).")
+    except Exception as e:
+        logger.exception("Embedding computation failed: %s", e)
+        await update.message.reply_text("I couldn't process that card image. Please try again.")
         return
 
-    keyboard_rows = [[InlineKeyboardButton(f"Watch {k}", callback_data=f"watch:{k}")] for k in dedup_buttons[:8]]
+    emb_blob = v.astype(np.float32).tobytes(order="C")
 
-    await update.message.reply_text(
-        "\n\n".join(summary_lines),
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
-        parse_mode="Markdown",
-    )
+    # 5) Persist as pending + save crop to disk
+    token = str(uuid.uuid4())
 
+    out_dir = USER_UPLOADS_DIR / str(user_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    crop_path = out_dir / f"{token}.png"
+    try:
+        crop_path.write_bytes(crop_bytes)
+    except Exception as e:
+        logger.exception("Failed to write crop to disk: %s", e)
+        await update.message.reply_text("Internal error saving the crop. Please try again.")
+        return
+
+    try:
+        await create_pending_prototype(
+            db,
+            token=token,
+            owner_user_id=user_id,
+            image_path=str(crop_path),
+            embedding_blob=emb_blob,
+            embedding_dim=512,
+            embedding_norm=1,
+            embedding_model=context.application.bot_data.get("embedding_model_tag"),
+        )
+    except Exception as e:
+        logger.exception("Failed to store pending prototype: %s", e)
+        await update.message.reply_text("Internal error storing pending card. Please try again.")
+        return
+
+    # Convenience: store token in user_data too (DB remains source of truth)
+    context.user_data["pending_token"] = token
+
+    # 6) Send the crop back + instructions
+    try:
+        bio = io.BytesIO(crop_bytes)
+        bio.name = "card.png"
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=InputFile(bio),
+            caption=(
+                "I detected one card.\n\n"
+                "If you want to watch it, reply with:\n"
+                "`/watch <nickname>`\n\n"
+                "Example:\n"
+                "`/watch charizard`\n\n"
+                "Or cancel with `/cancel`."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Failed to send cropped preview: %s", e)
+        await update.message.reply_text(
+            "I detected one card. Reply with `/watch <nickname>` to watch it, or `/cancel`.",
+            parse_mode="Markdown",
+        )
 # Group photo handler
 
 async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
 
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    # Ignore photos sent by bots (optional but sensible)
+    if update.effective_user and update.effective_user.is_bot:
+        return
+
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
-    # Download image
+    # De-dup per (chat_id, message_id, user_id) is done at notify time; still we crop once per message.
     try:
         image_bytes = await download_best_photo_bytes(update, context)
     except Exception as e:
         logger.exception("Failed to download group photo: %s", e)
         return
 
-    # Classify
+    tel_cropper = context.application.bot_data.get("tel_cropper")
+    if tel_cropper is None:
+        logger.error("tel_cropper not loaded; check post_init")
+        return
+
+    conf = float(context.application.bot_data.get("tel_cropper_conf", 0.25))
+    imgsz = int(context.application.bot_data.get("tel_cropper_imgsz", 960))
+    pad = float(context.application.bot_data.get("tel_cropper_pad", 0.01))
+    max_crops = int(context.application.bot_data.get("tel_cropper_max_crops", 6))
+    threshold = float(context.application.bot_data.get("watch_sim_threshold", 0.90))
+
+    # 1) Crop telegram image (blocking -> thread)
     try:
-        ranked = await classify_image(db, context, image_bytes, top_k=3)
+        crop_bytes_list = await asyncio.to_thread(
+            crop_telegram_cards_from_bytes,
+            tel_cropper=tel_cropper,
+            image_bytes=image_bytes,
+            conf=conf,
+            imgsz=imgsz,
+            pad=pad,
+            max_crops_per_image=max_crops,
+            aspect_expand=True,
+            scan_fallback=True,
+            rotate_portrait=True,
+        )
     except Exception as e:
-        logger.exception("Classifier failed: %s", e)
+        logger.exception("Telegram cropper failed: %s", e)
         return
 
-    keycodes: list[str] = []
-    seen: set[str] = set()
-    for k, _ in ranked:
-        kk = normalize_keycode(k)
-        if kk and kk not in seen:
-            seen.add(kk)
-            keycodes.append(kk)
+    if not crop_bytes_list:
+        return  # nothing detected
 
-    if not keycodes:
+    # 2) Compute embeddings for crops (keep alignment)
+    encoder = context.application.bot_data["encoder"]
+    device = context.application.bot_data["device"]
+
+    crop_items: list[tuple[bytes, np.ndarray]] = []
+    for cb in crop_bytes_list:
+        try:
+            v = await asyncio.to_thread(
+                compute_embedding_from_png_or_jpg_bytes,
+                cb,
+                encoder=encoder,
+                device=device,
+            )
+            crop_items.append((cb, v))
+        except Exception:
+            continue
+
+    if not crop_items:
         return
 
-    watchers_by_code = await watchers_for_keycodes(db, keycodes)
-    if not watchers_by_code:
-        return
 
-    # Notify watchers
-    chat_name = update.effective_chat.title or "this group"
+    # 3) Ensure prototypes cache is ready
+    if context.application.bot_data.get("proto_cache_dirty", True) or not context.application.bot_data.get("proto_cache"):
+        try:
+            context.application.bot_data["proto_cache"] = await rebuild_user_prototypes_cache(db)
+            context.application.bot_data["proto_cache_dirty"] = False
+            logger.info("Rebuilt user_prototypes cache")
+        except Exception as e:
+            logger.exception("Failed to rebuild user_prototypes cache: %s", e)
+            return
 
-    for keycode, user_ids in watchers_by_code.items():
-        for user_id in user_ids:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Watched card detected in {chat_name}: {keycode}",
-                )
-            except TelegramError:
-                pass
+    proto_cache: dict[int, dict[str, object]] = context.application.bot_data["proto_cache"]
+    if not proto_cache:
+        return  # no watchers
+
+    # Useful context for DM message
+    group_title = chat.title or str(chat.id)
+    sender_name = update.effective_user.full_name if update.effective_user else "Someone"
+    msg_id = update.message.message_id
+    chat_id = chat.id
+
+    notified_triplets: set[tuple[int, int, int]] = context.application.bot_data.setdefault("notified_triplets", set())
+
+    # 4) Compare per user and notify at most once per message
+    for user_id, d in proto_cache.items():
+        triplet = (chat_id, msg_id, int(user_id))
+        if triplet in notified_triplets:
+            continue
+
+        mat: np.ndarray = d["mat"]  # (M,512)
+        nicks: list[str] = d["nicks"]
+
+        best_sim = -1.0
+        best_nick = None
+        best_crop_bytes = None
+
+        # Find best match across all crops (aligned bytes + embedding)
+        for cb, v in crop_items:
+            sims = mat @ v  # (M,)
+            j = int(np.argmax(sims))
+            s = float(sims[j])
+            if s > best_sim:
+                best_sim = s
+                best_nick = nicks[j]
+                best_crop_bytes = cb
+
+
+        if best_nick is None or best_crop_bytes is None:
+            continue
+
+        if best_sim < threshold:
+            continue
+
+        # Mark de-dup before sending to avoid double-notifies on retry
+        notified_triplets.add(triplet)
+
+        caption = (
+            f"Match found in group: {group_title}\n"
+            f"Watched: {best_nick}\n"
+            f"Similarity: {best_sim:.3f}\n"
+            f"Posted by: {sender_name}"
+        )
+
+        try:
+            bio = io.BytesIO(best_crop_bytes)
+            bio.name = "match.png"
+            await context.bot.send_photo(
+                chat_id=int(user_id),
+                photo=InputFile(bio),
+                caption=caption,
+            )
+        except (Forbidden, BadRequest):
+            # User hasn't started bot / cannot be messaged; silently skip
+            continue
+        except TelegramError as e:
+            logger.warning("Failed to DM user %s: %s", user_id, e)
+            continue
 
 # Callback handler for inline buttons
 async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -806,57 +1001,170 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('This is a custom command response!')
 
-async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+def _normalize_nickname(n: str) -> str:
+    return n.strip().lower()
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use /watch in a private chat with me.")
         return
 
-    if not context.args:
-        await update.message.reply_text("Usage: /watch <keycode> [nickname]")
-        return
-
-    keycode = normalize_keycode(context.args[0])
-    nickname = " ".join(context.args[1:]).strip() if len(context.args) > 1 else None
-
-    if nickname and len(nickname) > 32:
-        await update.message.reply_text("Nickname too long (max 32 characters).")
-        return
-
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-
-    try:
-        await db_add_watch(db, update.effective_user.id, keycode, nickname=nickname)
-    except sqlite3.IntegrityError:
-        await update.message.reply_text("Nickname already used in your watchlist. Pick another one.")
-        return
-
-    if nickname:
-        await update.message.reply_text(f"Watching {keycode} as '{nickname}'.")
-    else:
-        await update.message.reply_text(f"Watching {keycode}.")
-
-
-async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /unwatch <keycode|nickname>")
-        return
-
-    token = " ".join(context.args).strip()
     db: aiosqlite.Connection = context.application.bot_data["db"]
     user_id = update.effective_user.id
 
-    # Prefer treating it as keycode first; if nothing removed, try nickname.
-    removed = await db_remove_watch(db, user_id, token)
-    if removed == 0:
-        removed = await db_remove_watch_by_nickname(db, user_id, token)
+    if not context.args:
+        await update.message.reply_text("Usage: `/watch <nickname>`", parse_mode="Markdown")
+        return
 
-    if removed == 0:
-        await update.message.reply_text("Nothing removed. Check the keycode/nickname.")
+    nickname = _normalize_nickname(" ".join(context.args))
+    if not nickname:
+        await update.message.reply_text("Nickname cannot be empty.")
+        return
+    if len(nickname) > 40:
+        await update.message.reply_text("Nickname is too long (max 40 chars).")
+        return
+
+    # Prefer token from user_data, but fall back to latest pending in DB
+    pending = await get_latest_pending_prototype(db, owner_user_id=user_id)
+    if not pending:
+        await update.message.reply_text("No pending card found. Send me a card photo first.")
+        return
+
+    token, image_path, emb_blob, dim, norm, model = pending
+
+    try:
+        proto_id = await create_user_prototype_from_pending(
+            db,
+            owner_user_id=user_id,
+            nickname=nickname,
+            image_path=image_path,
+            embedding_blob=emb_blob,
+            embedding_dim=dim,
+            embedding_norm=norm,
+            embedding_model=model,
+        )
+        
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(
+            f"You already have a watched card named `{nickname}`. Choose another nickname.",
+            parse_mode="Markdown",
+        )
+        return
+    except Exception as e:
+        logger.exception("Failed to create user prototype: %s", e)
+        await update.message.reply_text("Failed to save this watched card. Please try again.")
+        return
+    context.application.bot_data["proto_cache_dirty"] = True
+
+    # Delete pending row (we keep the image_path as-is)
+    try:
+        await delete_pending_prototype(db, token=token, owner_user_id=user_id)
+    except Exception as e:
+        logger.warning("Failed to delete pending prototype %s: %s", token, e)
+
+    context.user_data.pop("pending_token", None)
+
+    await update.message.reply_text(
+        f"Saved. I will watch this card as `{nickname}` (id={proto_id}).",
+        parse_mode="Markdown",
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+    user_id = update.effective_user.id
+
+    pending = await get_latest_pending_prototype(db, owner_user_id=user_id)
+    if not pending:
+        await update.message.reply_text("No pending card to cancel.")
+        return
+
+    token, image_path, *_ = pending
+
+    try:
+        await delete_pending_prototype(db, token=token, owner_user_id=user_id)
+    except Exception as e:
+        logger.exception("Failed to delete pending prototype: %s", e)
+
+    # best-effort delete file
+    try:
+        if image_path:
+            Path(image_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    context.user_data.pop("pending_token", None)
+    await update.message.reply_text("Cancelled. Send another card photo when ready.")
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+
+    if not context.args:
+        msg = "Usage: `/unwatch <nickname>`"
+        if chat and chat.type != "private":
+            # prefer DM
+            try:
+                await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+                await update.message.reply_text("I sent you instructions in DM.")
+            except Exception:
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    nickname = _normalize_nickname(" ".join(context.args))
+    if not nickname:
+        await update.message.reply_text("Nickname cannot be empty.")
+        return
+
+    try:
+        image_path = await delete_user_prototype_by_nickname(
+            db, owner_user_id=user_id, nickname=nickname
+        )
+    except Exception as e:
+        logger.exception("Failed to delete user prototype: %s", e)
+        await update.message.reply_text("Failed to remove that card. Please try again.")
+        return
+
+    if image_path is None:
+        text = f"No learned card named `{nickname}` found."
     else:
-        await update.message.reply_text("Removed from your watchlist.")
+        # Best-effort file cleanup
+        context.application.bot_data["proto_cache_dirty"] = True
 
+        try:
+            if image_path:
+                Path(image_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        text = f"Removed learned card `{nickname}`."
+
+    # If invoked outside private, DM result
+    if chat and chat.type != "private":
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
+            await update.message.reply_text("Done. I sent you the result in DM.")
+        except (Forbidden, BadRequest):
+            await update.message.reply_text(
+                "I can't DM you yet. Please open a private chat with me, press Start, then try again."
+            )
+        except TelegramError:
+            await update.message.reply_text("Telegram error while sending DM.")
+        return
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -880,32 +1188,59 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
+
+    # Old keycode-based watchlist entries (if you still use them)
     cur = await db.execute(
         "SELECT keycode, nickname FROM watchlist WHERE user_id = ? ORDER BY keycode",
         (user_id,),
     )
-    rows = await cur.fetchall()
+    keycode_rows = await cur.fetchall()
 
-    if not rows:
+    # New user-learned watched cards (this is what /watch <nickname> creates)
+    cur = await db.execute(
+        """
+        SELECT id, nickname, created_at
+        FROM user_prototypes
+        WHERE owner_user_id = ?
+        ORDER BY created_at DESC
+        """,
+        (user_id,),
+    )
+    proto_rows = await cur.fetchall()
+
+    if not keycode_rows and not proto_rows:
         text = (
-            "Your watchlist is empty. DM me a card photo to add one "
-            "(send a photo in a private chat and tap “Watch ...”)."
+            "Your watchlist is empty.\n\n"
+            "Send me a card photo in DM. If exactly one card is detected, I will ask you to run:\n"
+            "`/watch <nickname>`"
         )
     else:
-        max_show = 50
-        shown = rows[:max_show]
+        lines = []
 
-        lines = ["Your watchlist:"]
-        for keycode, nickname in shown:
-            if nickname:
-                lines.append(f"- `{keycode}` — *{nickname}*")
-            else:
-                lines.append(f"- `{keycode}`")
+        if proto_rows:
+            lines.append("Your learned cards:")
+            max_show = 50
+            shown = proto_rows[:max_show]
+            for proto_id, nickname, created_at in shown:
+                # proto_id is useful for future /unwatch-by-id commands
+                lines.append(f"- *{nickname}* (id={proto_id})")
+            if len(proto_rows) > max_show:
+                lines.append(f"(+{len(proto_rows) - max_show} more not shown)")
+            lines.append("")  # blank line between sections
 
-        if len(rows) > max_show:
-            lines.append(f"(+{len(rows) - max_show} more not shown)")
+        if keycode_rows:
+            lines.append("Your catalog cards:")
+            max_show = 50
+            shown = keycode_rows[:max_show]
+            for keycode, nickname in shown:
+                if nickname:
+                    lines.append(f"- `{keycode}` — *{nickname}*")
+                else:
+                    lines.append(f"- `{keycode}`")
+            if len(keycode_rows) > max_show:
+                lines.append(f"(+{len(keycode_rows) - max_show} more not shown)")
 
-        text = "\n".join(lines)
+        text = "\n".join(lines).rstrip()
 
     # If invoked in a group, prefer DM to avoid spamming/leaking lists.
     if chat and chat.type != "private":
@@ -994,6 +1329,21 @@ async def post_init(app: Application):
 
     app.bot_data["encoder"] = encoder
     app.bot_data["device"] = device
+    app.bot_data["tel_cropper"] = YOLO(TEL_CROPPER_MODEL_PATH)
+    app.bot_data["tel_cropper_conf"] = TEL_CROPPER_CONF
+    app.bot_data["tel_cropper_imgsz"] = TEL_CROPPER_IMGSZ
+    app.bot_data["tel_cropper_pad"] = TEL_CROPPER_PAD
+    app.bot_data["tel_cropper_max_crops"] = TEL_CROPPER_MAX_CROPS
+
+    app.bot_data["watch_sim_threshold"] = WATCH_SIM_THRESHOLD
+
+    # watched-prototypes cache
+    app.bot_data["proto_cache_dirty"] = True
+    app.bot_data["proto_cache"] = {}  # filled on first use
+
+    # de-dup notifications: (chat_id, message_id, user_id)
+    app.bot_data["notified_triplets"] = set()
+
 
     # ---- Load card embeddings into memory ----
     rows = await db.execute_fetchall(
@@ -1048,16 +1398,16 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('start', start_command))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CommandHandler('custom', custom_command))
-    app.add_handler(CommandHandler('watch', watch_command))
     app.add_handler(CommandHandler('unwatch', unwatch_command))
     app.add_handler(CommandHandler('identify', identify_command))
     app.add_handler(CommandHandler('watchlist', watchlist_command))
     app.add_handler(CommandHandler("clearwatchlist", clearwatchlist_command))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
-    app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo))
- 
+    app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo)) 
     app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch:"))
     app.add_handler(CallbackQueryHandler(handle_watchnick_callback, pattern=r"^watchnick:"))
     app.add_handler(CallbackQueryHandler(handle_watchnick_aux_callback, pattern=r"^watchnick_skip:|^watchnick_cancel$"))

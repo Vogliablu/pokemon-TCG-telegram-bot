@@ -15,6 +15,7 @@ wheels/
 
 # Image files
 seed_images/
+data/
 # Database files 
 *.db
 *.db-wal
