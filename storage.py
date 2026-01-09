@@ -328,3 +328,56 @@ async def set_user_prototype_threshold(
     )
     await db.commit()
     return int(cur.rowcount or 0)
+
+async def upsert_single_pending_prototype(
+    db: aiosqlite.Connection,
+    *,
+    token: str,
+    owner_user_id: int,
+    image_path: str,
+    embedding_blob: bytes,
+    embedding_dim: int = 512,
+    embedding_norm: int = 1,
+    embedding_model: str | None = None,
+) -> Optional[str]:
+    """
+    Ensures only ONE pending prototype exists per user.
+    Returns the previous pending image_path (if any) so the caller can delete the old file.
+    """
+    # One transaction: read old, replace row
+    await db.execute("BEGIN IMMEDIATE")
+
+    cur = await db.execute(
+        "SELECT image_path FROM pending_prototypes WHERE owner_user_id = ?",
+        (int(owner_user_id),),
+    )
+    row = await cur.fetchone()
+    old_path = str(row[0]) if row and row[0] else None
+
+    # Delete any existing pending for the user
+    await db.execute(
+        "DELETE FROM pending_prototypes WHERE owner_user_id = ?",
+        (int(owner_user_id),),
+    )
+
+    # Insert new pending
+    await db.execute(
+        """
+        INSERT INTO pending_prototypes(
+          token, owner_user_id, image_path,
+          embedding, embedding_dim, embedding_norm, embedding_model
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            int(owner_user_id),
+            image_path,
+            embedding_blob,
+            int(embedding_dim),
+            int(embedding_norm),
+            embedding_model,
+        ),
+    )
+
+    await db.commit()
+    return old_path

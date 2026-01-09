@@ -240,4 +240,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await db.executescript(SCHEMA)
     await _migrate(db)
     await migrate_add_user_prototypes_threshold(db)
+    await db.execute(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_one_per_user "
+    "ON pending_prototypes(owner_user_id)"
+)
     return db

@@ -31,6 +31,7 @@ from storage import (
     create_user_prototype_from_pending,
     delete_user_prototype_by_nickname,
     set_user_prototype_threshold,
+    upsert_single_pending_prototype
 )
 import uuid
 import asyncio
@@ -48,7 +49,7 @@ VISION_ROOT = Path(__file__).resolve().parent / "vision"
 USER_UPLOADS_DIR = Path("data/user_uploads")  # keep out of git
 USER_CROPPER_MODEL_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
 USER_CROPPER_CONF = float(os.getenv("USER_CROPPER_CONF", "0.60"))
-USER_CROPPER_MAX_CROPS = int(os.getenv("USER_CROPPER_MAX_CROPS", "3"))
+USER_CROPPER_MAX_CROPS = int(os.getenv("USER_CROPPER_MAX_CROPS", "32"))
 ENCODER_PATH = VISION_ROOT / "encoder" / "last.pt"
 USER_CROPPER_PATH = VISION_ROOT / "user_cropper" / "weights" / "best.pt"
 TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
@@ -59,7 +60,7 @@ WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.70"))  # tune la
 TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
 TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
 TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
-TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "6"))
+TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "32"))
 
 EMBED_TF = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -558,6 +559,31 @@ def compute_embedding_from_png_or_jpg_bytes(
     v /= (np.linalg.norm(v) + 1e-12)
     return v
 
+
+async def send_dm_only(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> bool:
+    """
+    Sends a DM to the user. If invoked from a group, sends ONLY the DM and stays silent in the group.
+    Returns True if the DM was sent, False otherwise.
+    """
+    if not update.effective_user:
+        return False
+
+    user_id = update.effective_user.id
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode=parse_mode)
+        return True
+    except (Forbidden, BadRequest):
+        # User hasn't started the bot or bot cannot DM them.
+        return False
+    except TelegramError:
+        return False
+
 async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -632,7 +658,7 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     emb_blob = v.astype(np.float32).tobytes(order="C")
 
-    # 5) Persist as pending + save crop to disk
+    # 5) Persist as pending + save crop to disk (Option B: keep only one pending per user)
     token = str(uuid.uuid4())
 
     out_dir = USER_UPLOADS_DIR / str(user_id)
@@ -646,7 +672,8 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        await create_pending_prototype(
+        # This replaces any previous pending for this user and returns the old image_path (if any)
+        old_path = await upsert_single_pending_prototype(
             db,
             token=token,
             owner_user_id=user_id,
@@ -660,6 +687,13 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("Failed to store pending prototype: %s", e)
         await update.message.reply_text("Internal error storing pending card. Please try again.")
         return
+
+    # Best-effort: delete the previous pending crop file from disk (avoid clutter)
+    try:
+        if old_path and old_path != str(crop_path):
+            Path(old_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
     # Convenience: store token in user_data too (DB remains source of truth)
     context.user_data["pending_token"] = token
@@ -677,7 +711,8 @@ async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYP
                 "`/watch <nickname>`\n\n"
                 "Example:\n"
                 "`/watch charizard`\n\n"
-                "Or cancel with `/cancel`."
+                "Or cancel with `/cancel`.\n"
+                "Only the latest pending card can be watched."
             ),
             parse_mode="Markdown",
         )
@@ -1010,17 +1045,28 @@ async def handle_nickname_reply(update: Update, context: ContextTypes.DEFAULT_TY
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Hello! I am your Pokemon Card Tracker Bot. Use /help to see what I can do!')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Available commands:\n'
-    '/start - Start the bot\n'
-    '/help - Show this help message\n'
-    '/watch <keycode> [nickname] - Add a card to your watchlist\n'
-    '/unwatch <keycode|nickname> - Remove a card from your watchlist\n'
-    '/identify - Send a photo of a card to identify its keycode\n'
-    '/watchlist - Show your current watchlist\n'
-    '/clearwatchlist - Remove all cards from your watchlist (DM only)\n'
-    '/setthreshold <nickname> <threshold> - Set similarity threshold for a watched card\n'
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "Available commands:\n"
+        "/start - Start the bot\n"
+        "/help - Show this help message\n"
+        "/watch <nickname> - Save the last detected card as a watched prototype (DM only)\n"
+        "/unwatch <nickname> - Remove a watched prototype (DM only)\n"
+        "/watchlist - Show your current watchlist (DM only)\n"
+        "/clearwatchlist - Remove all cards from your watchlist (DM only)\n"
+        "/setthreshold <nickname> <threshold> - Set similarity threshold for a watched card\n"
+        "\n"
+        "Threshold guide (similarity): Very likely ≥ 0.77 | Quite likely 0.73–0.77 | Possible 0.68–0.73\n"
+        "Tip: Too many false positives → raise by +0.02. Missing matches → lower by −0.02.\n"
     )
+
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        # DM only; do not reply in the group
+        await send_dm_only(update, context, help_text)
+        return
+
+    await update.message.reply_text(help_text)
 
 async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('This is a custom command response!')
@@ -1032,14 +1078,14 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message or not update.effective_chat:
         return
     if update.effective_chat.type != "private":
-        await update.message.reply_text("Use /watch in a private chat with me.")
+        await send_dm_only(update, context, "Use /watch in a private chat with me.")
         return
-
+    
     db: aiosqlite.Connection = context.application.bot_data["db"]
     user_id = update.effective_user.id
 
-    if not context.args:
-        await update.message.reply_text("Usage: `/watch <nickname>`", parse_mode="Markdown")
+    if not context.args and update.effective_chat.type == "private":
+        await update.message.reply_text("Usage: First send an image of your card, then use `/watch <nickname>`", parse_mode="Markdown")
         return
 
     nickname = _normalize_nickname(" ".join(context.args))
@@ -1141,7 +1187,7 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # prefer DM
             try:
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-                await update.message.reply_text("I sent you instructions in DM.")
+                #await update.message.reply_text("I sent you instructions in DM.")
             except Exception:
                 await update.message.reply_text(msg, parse_mode="Markdown")
             return
@@ -1190,19 +1236,19 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+# async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
 
-    chat = update.effective_chat
-    if chat and chat.type != "private":
-        await update.message.reply_text("Please DM me /identify, then send the card photo.")
-        return
+#     chat = update.effective_chat
+#     if chat and chat.type != "private":
+#         await update.message.reply_text("Please DM me /identify, then send the card photo.")
+#         return
 
-    # Your existing DM photo handler does the actual classification. :contentReference[oaicite:5]{index=5}
-    await update.message.reply_text(
-        "Send me a clear photo of the card here, and I'll reply with the detected keycode(s)."
-    )
+#     # Your existing DM photo handler does the actual classification. :contentReference[oaicite:5]{index=5}
+#     await update.message.reply_text(
+#         "Send me a clear photo of the card here, and I'll reply with the detected keycode(s)."
+#     )
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
@@ -1270,19 +1316,19 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If invoked in a group, prefer DM to avoid spamming/leaking lists.
     if chat and chat.type != "private":
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode="Markdown",
-            )
-            await update.message.reply_text("I sent you your watchlist in DM.")
-        except (Forbidden, BadRequest):
-            await update.message.reply_text(
-                "I can't DM you yet. Please open a private chat with me, press Start, then try /watchlist again."
-            )
-        except TelegramError:
-            await update.message.reply_text("Failed to retrieve your watchlist due to a Telegram error.")
+        #try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="Markdown",
+        )
+        #await update.message.reply_text("I sent you your watchlist in DM.")
+        # except (Forbidden, BadRequest):
+        #     await update.message.reply_text(
+        #         "I can't DM you yet. Please open a private chat with me, press Start, then try /watchlist again."
+        #     )
+        # except TelegramError:
+        #     await update.message.reply_text("Failed to retrieve your watchlist due to a Telegram error.")
         return
 
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -1296,7 +1342,7 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # Avoid running destructive ops from group chats
     if chat and chat.type != "private":
-        await update.message.reply_text("Please DM me /clearwatchlist to clear your personal watchlist.")
+        await send_dm_only(update,context,"Please DM me /clearwatchlist to clear your personal watchlist.")
         return
 
     # Safety confirmation
@@ -1316,12 +1362,12 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
 async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Use /setthreshold in a private chat with me.")
-        return
+    # if update.effective_chat.type != "private":
+    #     await update.message.reply_text("Use /setthreshold in a private chat with me.")
+    #     return
 
     if len(context.args) < 2:
-        await update.message.reply_text(
+        await send_dm_only(update, context,
             "Usage: `/setthreshold <nickname> <value>`\nExample: `/setthreshold charizard 0.86`",
             parse_mode="Markdown",
         )
@@ -1418,30 +1464,30 @@ async def post_init(app: Application):
 
 
 
-    # ---- Load card embeddings into memory ----
-    rows = await db.execute_fetchall(
-        "SELECT keycode, embedding FROM cards WHERE embedding IS NOT NULL"
-    )
+    # # ---- Load card embeddings into memory ----
+    # rows = await db.execute_fetchall(
+    #     "SELECT keycode, embedding FROM cards WHERE embedding IS NOT NULL"
+    # )
 
-    keycodes = []
-    vectors = []
+    # keycodes = []
+    # vectors = []
 
-    for keycode, blob in rows:
-        vec = np.frombuffer(blob, dtype=np.float32)
-        if vec.shape[0] != 512:
-            continue
-        keycodes.append(str(keycode))
-        vectors.append(vec)
+    # for keycode, blob in rows:
+    #     vec = np.frombuffer(blob, dtype=np.float32)
+    #     if vec.shape[0] != 512:
+    #         continue
+    #     keycodes.append(str(keycode))
+    #     vectors.append(vec)
 
-    if not vectors:
-        raise RuntimeError("No embeddings found in DB. Did you run backfill?")
+    # if not vectors:
+    #     raise RuntimeError("No embeddings found in DB. Did you run backfill?")
 
-    mat = np.vstack(vectors)  # shape (N, 512)
+    # mat = np.vstack(vectors)  # shape (N, 512)
 
-    app.bot_data["emb_keycodes"] = keycodes
-    app.bot_data["emb_matrix"] = mat
+    # app.bot_data["emb_keycodes"] = keycodes
+    # app.bot_data["emb_matrix"] = mat
 
-    print(f"Loaded {len(keycodes)} card embeddings into memory")
+    # print(f"Loaded {len(keycodes)} card embeddings into memory")
     # Step 3: YOLO user cropper (load once)
     app.bot_data["user_cropper"] = YOLO(USER_CROPPER_MODEL_PATH)
     app.bot_data["user_cropper_conf"] = USER_CROPPER_CONF
@@ -1449,11 +1495,10 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("help", "Show help"),
-        BotCommand("identify", "Identify a card from a photo (DM only)"),
-        BotCommand("watch", "Add a card to your watchlist"),
+        BotCommand("watch", "Add a card to your watchlist, after sending a photo"),
         BotCommand("unwatch", "Remove a card from your watchlist"),
         BotCommand("watchlist", "Show your watchlist"),
-        BotCommand("clearwatchlist", "Remove all cards from your watchlist (DM)"),
+        BotCommand("clearwatchlist", "Remove all cards from your watchlist"),
         BotCommand("setthreshold", "Set per-card threshold: /setthreshold <nickname> <value>"),
 
 
@@ -1474,7 +1519,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CommandHandler('custom', custom_command))
     app.add_handler(CommandHandler('unwatch', unwatch_command))
-    app.add_handler(CommandHandler('identify', identify_command))
+    #app.add_handler(CommandHandler('identify', identify_command))
     app.add_handler(CommandHandler('watchlist', watchlist_command))
     app.add_handler(CommandHandler("clearwatchlist", clearwatchlist_command))
     app.add_handler(CommandHandler("watch", watch_command))
