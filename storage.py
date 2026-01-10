@@ -19,40 +19,8 @@ async def ensure_user(db: aiosqlite.Connection, user_id: int) -> None:
     await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user_id,))
     await db.commit()
 
-async def add_watch(
-    db: aiosqlite.Connection,
-    user_id: int,
-    keycode: str,
-    *,
-    nickname: Optional[str] = None,
-) -> None:
-    keycode = normalize_keycode(keycode)
-    nick = normalize_nickname(nickname) if nickname else None
 
-    await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user_id,))
-    await db.execute(
-        "INSERT OR REPLACE INTO watchlist(user_id, keycode, nickname) VALUES (?, ?, ?)",
-        (user_id, keycode, nick),
-    )
-    await db.commit()
 
-async def remove_watch(db: aiosqlite.Connection, user_id: int, keycode: str) -> int:
-    keycode = normalize_keycode(keycode)
-    cur = await db.execute(
-        "DELETE FROM watchlist WHERE user_id = ? AND keycode = ?",
-        (user_id, keycode),
-    )
-    await db.commit()
-    return int(cur.rowcount or 0)
-
-async def remove_watch_by_nickname(db: aiosqlite.Connection, user_id: int, nickname: str) -> int:
-    nick = normalize_nickname(nickname)
-    cur = await db.execute(
-        "DELETE FROM watchlist WHERE user_id = ? AND nickname = ?",
-        (user_id, nick),
-    )
-    await db.commit()
-    return int(cur.rowcount or 0)
 
 
 async def watchers_for_keycodes(
@@ -84,49 +52,8 @@ CardRow = Tuple[
     Optional[bytes], Optional[int], Optional[int], Optional[str],
 ]
 
-async def get_card_features(db: aiosqlite.Connection) -> List[Tuple[str, float, float, float]]:
-    cur = await db.execute("SELECT keycode, avg_r, avg_g, avg_b FROM cards")
-    rows = await cur.fetchall()
-    return [(str(k), float(r), float(g), float(b)) for (k, r, g, b) in rows]
 
-async def get_cards_by_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str]) -> Dict[str, CardRow]:
-    norm = [normalize_keycode(k) for k in keycodes if k and k.strip()]
-    if not norm:
-        return {}
 
-    placeholders = ",".join("?" for _ in norm)
-    cur = await db.execute(
-        f"""
-        SELECT
-          keycode, name, image_path, image_url, telegram_file_id,
-          avg_r, avg_g, avg_b,
-          embedding, embedding_dim, embedding_norm, embedding_model
-        FROM cards
-        WHERE keycode IN ({placeholders})
-        """,
-        tuple(norm),
-    )
-    rows = await cur.fetchall()
-    out: Dict[str, CardRow] = {}
-    for row in rows:
-        k = str(row[0])
-        out[k] = (
-            k, row[1], row[2], row[3], row[4],
-            float(row[5]), float(row[6]), float(row[7]),
-            row[8],
-            (int(row[9]) if row[9] is not None else None),
-            (int(row[10]) if row[10] is not None else None),
-            (str(row[11]) if row[11] is not None else None),
-        )
-    return out
-
-async def set_card_telegram_file_id(db: aiosqlite.Connection, keycode: str, telegram_file_id: str) -> None:
-    keycode = normalize_keycode(keycode)
-    await db.execute(
-        "UPDATE cards SET telegram_file_id = ? WHERE keycode = ?",
-        (telegram_file_id, keycode),
-    )
-    await db.commit()
 
 # -----------------
 # Embeddings (new)
@@ -165,35 +92,6 @@ from typing import Optional, Tuple
 # Pending prototypes
 # -----------------
 
-async def create_pending_prototype(
-    db: aiosqlite.Connection,
-    *,
-    token: str,
-    owner_user_id: int,
-    image_path: str,
-    embedding_blob: bytes,
-    embedding_dim: int = 512,
-    embedding_norm: int = 1,
-    embedding_model: str | None = None,
-) -> None:
-    await db.execute(
-        """
-        INSERT OR REPLACE INTO pending_prototypes(
-          token, owner_user_id, image_path,
-          embedding, embedding_dim, embedding_norm, embedding_model
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            token,
-            owner_user_id,
-            image_path,
-            embedding_blob,
-            int(embedding_dim),
-            int(embedding_norm),
-            embedding_model,
-        ),
-    )
-    await db.commit()
 
 
 async def get_latest_pending_prototype(

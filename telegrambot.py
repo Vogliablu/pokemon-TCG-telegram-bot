@@ -5,10 +5,10 @@ import tempfile
 import logging
 import time
 from dotenv import load_dotenv
-from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
+from typing import Final, List, Tuple
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
-    InputFile, InputMediaPhoto, User
+    Update, BotCommand,
+    InputFile, User
 )
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, Forbidden, BadRequest
@@ -16,15 +16,7 @@ import aiosqlite
 from db import init_db
 import sqlite3
 from storage import (
-    add_watch as db_add_watch,
-    remove_watch as db_remove_watch,
-    remove_watch_by_nickname as db_remove_watch_by_nickname,
-    normalize_keycode,
-    get_card_features as db_get_card_features,
-    get_cards_by_keycodes as db_get_cards_by_keycodes,
-    set_card_telegram_file_id as db_set_card_telegram_file_id,
     ensure_user,
-    create_pending_prototype,
     get_latest_pending_prototype,
     delete_pending_prototype,
     create_user_prototype_from_pending,
@@ -35,10 +27,8 @@ from storage import (
     delete_all_user_prototypes_return_paths
 )
 import uuid
-import asyncio
-import urllib.request
 from pathlib import Path
-from PIL import Image, ImageStat
+from PIL import Image
 import numpy as np
 import torch
 import torchvision
@@ -397,18 +387,7 @@ def crop_telegram_cards_from_bytes(
     return crops
 
 
-def nickname_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return bool(context.user_data.get("pending_nickname_keycode"))
 
-def normalize_keycode(code: str) -> str:
-    return code.strip().upper()
-
-def avg_rgb_from_bytes(image_bytes: bytes) -> tuple[float, float, float]:
-    with Image.open(io.BytesIO(image_bytes)) as im:
-        im = im.convert("RGB")
-        stat = ImageStat.Stat(im)
-        r, g, b = stat.mean
-        return float(r), float(g), float(b)
 
 def build_resnet18_encoder_from_lastpt(last_pt: Path, device: torch.device) -> nn.Module:
     ckpt = torch.load(last_pt, map_location=device, weights_only=False)
@@ -462,39 +441,6 @@ async def rebuild_user_prototypes_cache(db: aiosqlite.Connection) -> dict[int, d
 
 
 
-async def _read_file_bytes(path: str) -> bytes:
-    p = Path(path)
-    return await asyncio.to_thread(p.read_bytes)
-
-async def _download_url_bytes(url: str) -> bytes:
-    def _dl() -> bytes:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; cardbot/1.0)"},
-        )
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            return resp.read()
-    return await asyncio.to_thread(_dl)
-
-async def load_card_image_bytes(image_path: str | None, image_url: str | None) -> bytes:
-    if image_path and image_path.strip():
-        return await _read_file_bytes(image_path.strip())
-    if image_url and image_url.strip():
-        return await _download_url_bytes(image_url.strip())
-    raise ValueError("Card has neither image_path nor image_url")
-
-async def ensure_card_index(context: ContextTypes.DEFAULT_TYPE, db: aiosqlite.Connection) -> list[tuple[str, float, float, float]]:
-    """
-    Cache card features in memory for faster classification.
-    context.application.bot_data["card_index"] = [(keycode, r,g,b), ...]
-    """
-    idx = context.application.bot_data.get("card_index")
-    if isinstance(idx, list) and idx:
-        return idx
-
-    rows = await db_get_card_features(db)
-    context.application.bot_data["card_index"] = rows
-    return rows
 
 async def classify_image(
     db: aiosqlite.Connection,
@@ -545,61 +491,8 @@ async def classify_image(
     return [(str(emb_keycodes[i]), float(sims[i])) for i in idx]
 
 
-async def watchers_for_keycodes(db: aiosqlite.Connection, keycodes: Iterable[str]) -> Dict[str, List[int]]:
-    """
-    Returns mapping: {keycode: [user_id, ...]} for watchers.
-    """
-    norm = [normalize_keycode(k) for k in keycodes if k and k.strip()]
-    if not norm:
-        return {}
-
-    placeholders = ",".join("?" for _ in norm)
-    cur = await db.execute(
-        f"SELECT keycode, user_id FROM watchlist WHERE keycode IN ({placeholders})",
-        tuple(norm),
-    )
-    rows = await cur.fetchall()
-    out: Dict[str, List[int]] = {}
-    for keycode, user_id in rows:
-        out.setdefault(keycode, []).append(int(user_id))
-    return out
-
-async def add_watch(db: aiosqlite.Connection, user_id: int, keycode: str) -> None:
-    keycode = normalize_keycode(keycode)
-    await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user_id,))
-    await db.execute(
-        "INSERT OR IGNORE INTO watchlist(user_id, keycode) VALUES (?, ?)",
-        (user_id, keycode),
-    )
-    await db.commit()
-
-def build_watch_keyboard(keycodes: List[str], max_buttons: int = 8) -> InlineKeyboardMarkup:
-    """
-    Creates inline buttons: "Watch <KEYCODE>".
-    Each press triggers callback_data: "watch:<KEYCODE>".
-    """
-    norm = []
-    seen = set()
-    for k in keycodes:
-        nk = normalize_keycode(k)
-        if nk and nk not in seen:
-            seen.add(nk)
-            norm.append(nk)
-
-    norm = norm[:max_buttons]
-    rows = [[InlineKeyboardButton(text=f"Watch {k}", callback_data=f"watch:{k}")] for k in norm]
-    return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
 
-
-def build_identify_keyboard(candidates: List[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for k in candidates:
-        rows.append([
-            InlineKeyboardButton(text=f"Watch {k}", callback_data=f"watch:{k}"),
-            InlineKeyboardButton(text="Watch + nickname", callback_data=f"watchnick:{k}"),
-        ])
-    return InlineKeyboardMarkup(rows)
 
 async def download_best_photo_bytes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bytes:
     """
@@ -1008,149 +901,7 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue
 
 # Callback handler for inline buttons
-async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data or not query.data.startswith("watch:"):
-        return
 
-    await query.answer()  # acknowledges the button press (stops the loading spinner)
-
-    user = query.from_user
-    if not user:
-        return
-
-    keycode = normalize_keycode(query.data.split("watch:", 1)[1])
-    if not keycode:
-        if query.message:
-            await query.message.reply_text("Invalid keycode.")
-        return
-
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-
-    try:
-        await db_add_watch(db, user.id, keycode)  # or add_watch(...) depending on your import name
-    except sqlite3.Error:
-        if query.message:
-            await query.message.reply_text("Database error while adding to watchlist.")
-        return
-
-    text = f"Added `{keycode}` to your watchlist."
-
-    # If the button was clicked in a group, DM the user to avoid noise/leaks.
-    chat = query.message.chat if query.message else None
-    if chat and chat.type != "private":
-        try:
-            await context.bot.send_message(chat_id=user.id, text=text, parse_mode="Markdown")
-            if query.message:
-                await query.message.reply_text("Done — I sent you a DM confirmation.")
-        except (Forbidden, BadRequest):
-            if query.message:
-                await query.message.reply_text(
-                    "Added, but I can't DM you yet. Please open a private chat with me and press Start."
-                )
-        except TelegramError:
-            if query.message:
-                await query.message.reply_text("Added, but failed to send DM confirmation.")
-        return
-
-    # Private chat: just reply in the same chat
-    if query.message:
-        await query.message.reply_text(text, parse_mode="Markdown")
-
-
-async def handle_watchnick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data or not query.data.startswith("watchnick:"):
-        return
-
-    await query.answer()
-
-    user = update.effective_user
-    if not user:
-        return
-
-    keycode = normalize_keycode(query.data.split("watchnick:", 1)[1])
-    if not keycode:
-        await query.message.reply_text("Invalid keycode.")
-        return
-
-    # store pending state
-    context.user_data["pending_nickname_keycode"] = keycode
-
-    # Provide skip/cancel buttons (optional but recommended)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Skip nickname", callback_data=f"watchnick_skip:{keycode}")],
-        [InlineKeyboardButton("Cancel", callback_data="watchnick_cancel")],
-    ])
-
-    await query.message.reply_text(
-        f"Send the nickname for `{keycode}` (max 32 chars), or tap Skip/Cancel.",
-        parse_mode="Markdown",
-        reply_markup=kb,
-    )
-
-async def handle_watchnick_aux_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-
-    await query.answer()
-
-    user = update.effective_user
-    if not user:
-        return
-
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-
-    if query.data == "watchnick_cancel":
-        context.user_data.pop("pending_nickname_keycode", None)
-        await query.message.reply_text("Cancelled.")
-        return
-
-    if query.data.startswith("watchnick_skip:"):
-        keycode = normalize_keycode(query.data.split("watchnick_skip:", 1)[1])
-        context.user_data.pop("pending_nickname_keycode", None)
-        await add_watch(db, user.id, keycode, nickname=None)
-        await query.message.reply_text(f"Added `{keycode}` to your watchlist.", parse_mode="Markdown")
-
-async def handle_nickname_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    keycode = context.user_data.get("pending_nickname_keycode")
-    if not keycode:
-        return  # not in nickname flow; let other handlers process
-
-    nickname = (update.message.text or "").strip()
-    if not nickname:
-        await update.message.reply_text("Nickname cannot be empty. Send a nickname, or tap Cancel.")
-        return
-
-    if nickname.lower() in ("skip", "/skip"):
-        db: aiosqlite.Connection = context.application.bot_data["db"]
-        await add_watch(db, update.effective_user.id, keycode, nickname=None)
-        context.user_data.pop("pending_nickname_keycode", None)
-        await update.message.reply_text(f"Added `{keycode}` to your watchlist.", parse_mode="Markdown")
-        return
-
-    if len(nickname) > 32:
-        await update.message.reply_text("Nickname too long (max 32). Try again, or tap Cancel.")
-        return
-
-    db: aiosqlite.Connection = context.application.bot_data["db"]
-    try:
-        await add_watch(db, update.effective_user.id, keycode, nickname=nickname)
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(
-            "That nickname is already used in your watchlist. Send a different nickname, or tap Cancel."
-        )
-        return
-
-    context.user_data.pop("pending_nickname_keycode", None)
-    await update.message.reply_text(
-        f"Added `{keycode}` as *{nickname}*.",
-        parse_mode="Markdown",
-    )
 
 
 # Commands
@@ -1348,19 +1099,6 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await reply_privately(update, context, f"Removed learned card `{nickname}`.", parse_mode="Markdown")
 
-# async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     if not update.message:
-#         return
-
-#     chat = update.effective_chat
-#     if chat and chat.type != "private":
-#         await update.message.reply_text("Please DM me /identify, then send the card photo.")
-#         return
-
-#     # Your existing DM photo handler does the actual classification. :contentReference[oaicite:5]{index=5}
-#     await update.message.reply_text(
-#         "Send me a clear photo of the card here, and I'll reply with the detected keycode(s)."
-#     )
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_is_addressed_to_me(update, context):
@@ -1748,19 +1486,9 @@ if __name__ == '__main__':
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
     app.add_handler(MessageHandler(filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP), handle_group_photo)) 
-    app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch:"))
-    app.add_handler(CallbackQueryHandler(handle_watchnick_callback, pattern=r"^watchnick:"))
-    app.add_handler(CallbackQueryHandler(handle_watchnick_aux_callback, pattern=r"^watchnick_skip:|^watchnick_cancel$"))
-
+ 
     # Group 0: stateful nickname replies (non-blocking)
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-            handle_nickname_reply,
-            block=False,
-        ),
-        group=0,
-    )
+ 
 
     # Group 1: normal text handling ("hello", fallback, etc.)
     app.add_handler(
