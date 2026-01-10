@@ -12,7 +12,7 @@ The bot checks for cards in the pictures sent in the groups it has joined. Once 
 In telegram start a chat with @Pokemon_Card_tracker_bot with the command `/start`.
 The general procedure is sending a picture of the card you want to receive notification for, and then adding it to the watchlist with a nickname with the command `/watch <nickname>`. 
 The list of all commands can be checked using `/help`.
-Other useful commands include `/watchlist` to check the watchlist, `/unwatch <nickname>` to remove a card from your watchlist, `/show <nickname>` to see an image of a card in the watchlist or `/setthreshold` to adjust the similarity threshold that need be met for notifications.  
+Other useful commands include `/watchlist` to check the watchlist, `/unwatch <nickname>` to remove a card from your watchlist, `/show <nickname>` to see an image of a card in the watchlist or `/setthreshold` to adjust the similarity threshold that needs to be met for notifications.  
 
 
 ## How it works
@@ -59,6 +59,30 @@ The image cropping and embedding pipeline is implemented in the `vision` submodu
 - **`.env` (not committed)**  
   Environment configuration (Telegram bot token, paths, thresholds).
 
+
+## Requirements
+- Python 3.11+ (see `requires-python` in `pyproject.toml`)
+- `uv` (recommended)
+
+## Install
+Dependencies are defined in `pyproject.toml` and pinned in `uv.lock`.
+```bash
+uv sync
+```
+## How to run the code
+1) Clone this github repo.
+2) Start a chat with @BotFather on telegram and obtain a bot token. Put it in a `.env` file as `BOT_TOKEN` (obviously not commited here)
+3) Install dependencies with
+```bash
+ uv sync
+ ```
+
+4) run the command 
+```bash
+uv run python telegrambot.py
+```
+
+
 ## Privacy notes
 
 ### For users
@@ -85,9 +109,6 @@ The image cropping and embedding pipeline is implemented in the `vision` submodu
   - This means the bot may notify users **who are not members of the group**.
   - As a result, buyers or collectors outside the group may become aware of cards posted in the group, or the existance of the group itself.
 
-- The bot does not expose the group chat itself, but group administrators should be aware that:
-  - card images may trigger notifications outside the group,
-  - the bot acts as a private monitoring tool for its users.
 
 ### General notes
 
