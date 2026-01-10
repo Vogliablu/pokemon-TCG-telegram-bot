@@ -70,7 +70,7 @@ The image cropping and embedding pipeline is implemented in the `vision` submodu
 ## How to run the code
 ### 1) Clone
 ```bash
-git clone https://github.com/Vogliablu/pokemon-TCG-telegram-bot.git
+git clone --recurse-submodules https://github.com/Vogliablu/pokemon-TCG-telegram-bot.git
 cd pokemon-TCG-telegram-bot
 ```
 ### 2) Create a Telegram bot token
