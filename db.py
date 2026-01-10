@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS user_prototypes (
   embedding_norm   INTEGER NOT NULL DEFAULT 1,
   embedding_model  TEXT,
 
-  threshold REAL NOT NULL DEFAULT 0.70,
+  threshold REAL NOT NULL DEFAULT 0.73,
 
   created_at       TEXT NOT NULL DEFAULT (datetime('now')),
 
@@ -221,7 +221,7 @@ async def migrate_add_user_prototypes_threshold(db: aiosqlite.Connection) -> Non
     # Add threshold column if missing
     if not await _column_exists(db, "user_prototypes", "threshold"):
         await db.execute(
-            "ALTER TABLE user_prototypes ADD COLUMN threshold REAL NOT NULL DEFAULT 0.70"
+            "ALTER TABLE user_prototypes ADD COLUMN threshold REAL NOT NULL DEFAULT 0.73"
         )
         await db.commit()
 

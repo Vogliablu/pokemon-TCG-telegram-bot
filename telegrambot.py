@@ -51,7 +51,7 @@ WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.73"))  # global 
 TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
 TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
 TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
-TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "32"))
+TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "64"))
 WATCH_MAX_MATCHES_PER_MESSAGE = int(os.getenv("WATCH_MAX_MATCHES_PER_MESSAGE", "3")) # how many per message to notify about
 
 EMBED_TF = transforms.Compose([
