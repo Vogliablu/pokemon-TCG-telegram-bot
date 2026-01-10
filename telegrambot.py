@@ -19,7 +19,6 @@ from storage import (
     add_watch as db_add_watch,
     remove_watch as db_remove_watch,
     remove_watch_by_nickname as db_remove_watch_by_nickname,
-    clear_watchlist as db_clear_watchlist,
     normalize_keycode,
     get_card_features as db_get_card_features,
     get_cards_by_keycodes as db_get_cards_by_keycodes,
@@ -32,7 +31,8 @@ from storage import (
     delete_user_prototype_by_nickname,
     set_user_prototype_threshold,
     upsert_single_pending_prototype,
-    get_user_prototype_by_nickname
+    get_user_prototype_by_nickname,
+    delete_all_user_prototypes_return_paths
 )
 import uuid
 import asyncio
@@ -1305,8 +1305,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message_is_addressed_to_me(update, context):
-        return    
-    
+        return
     if not update.message or not update.effective_user:
         return
 
@@ -1316,14 +1315,6 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not context.args:
         msg = "Usage: `/unwatch <nickname>`"
-        if chat and chat.type != "private":
-            # prefer DM
-            try:
-                await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-                #await update.message.reply_text("I sent you instructions in DM.")
-            except Exception:
-                await reply_privately(update, context, msg, parse_mode="Markdown")
-            return
         await reply_privately(update, context, msg, parse_mode="Markdown")
         return
 
@@ -1342,30 +1333,20 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if image_path is None:
-        text = f"No learned card named `{nickname}` found."
-    else:
-        # Best-effort file cleanup
-        context.application.bot_data["proto_cache_dirty"] = True
-
-        try:
-            if image_path:
-                Path(image_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        text = f"Removed learned card `{nickname}`."
-
-    # If invoked outside private: DM result and stay silent in the group
-    if chat and chat.type != "private":
-        try:
-            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
-        except (Forbidden, BadRequest):
-            # Can't DM user (likely hasn't started the bot). Stay silent in group.
-            logger.info("Cannot DM user %s (hasn't started bot?) for /unwatch result.", user_id)
-        except TelegramError as e:
-            logger.warning("Telegram error while DMing user %s: %s", user_id, e)
+        await reply_privately(update, context, f"No learned card named `{nickname}` found.", parse_mode="Markdown")
         return
 
-    await reply_privately(update, context, text, parse_mode="Markdown")
+    # Watchlist changed -> mark cache dirty
+    context.application.bot_data["proto_cache_dirty"] = True
+
+    # Best-effort file cleanup
+    try:
+        if image_path:
+            Path(image_path).unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning("Failed to delete prototype image %s: %s", image_path, e)
+
+    await reply_privately(update, context, f"Removed learned card `{nickname}`.", parse_mode="Markdown")
 
 # async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     if not update.message:
@@ -1467,10 +1448,9 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await reply_privately(update, context, text, parse_mode="Markdown")
 
-async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message_is_addressed_to_me(update, context):
-        return   
-   
+        return
     if not update.effective_user or not update.message:
         return
 
@@ -1485,16 +1465,41 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
     # Safety confirmation
     token = (context.args[0].lower() if context.args else "")
     if token not in ("confirm", "yes"):
-        await update.message.reply_text(
+        await reply_privately(
+            update,
+            context,
             "This will remove ALL cards from your watchlist.\n"
             "To confirm, run:\n"
-            "/clearwatchlist confirm"
+            "`/clearwatchlist confirm`",
+            parse_mode="Markdown",
         )
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
-    removed = await db_clear_watchlist(db, user_id)
-    await reply_privately(update, context, f"Cleared your watchlist. Removed {removed} entr(y/ies).")
+
+    try:
+        paths = await delete_all_user_prototypes_return_paths(db, owner_user_id=user_id)
+    except Exception as e:
+        logger.exception("Failed to clear watchlist for user %s: %s", user_id, e)
+        await reply_privately(update, context, "Failed to clear your watchlist. Please try again.")
+        return
+
+    # Watchlist changed -> mark cache dirty
+    context.application.bot_data["proto_cache_dirty"] = True
+
+    deleted = 0
+    for p in paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+            deleted += 1
+        except Exception as e:
+            logger.warning("Failed to delete prototype image %s: %s", p, e)
+
+    await reply_privately(
+        update,
+        context,
+        f"Cleared your watchlist. Removed {len(paths)} entr(y/ies). Deleted {deleted} local image(s).",
+    )
 
 async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message_is_addressed_to_me(update, context):

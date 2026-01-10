@@ -54,10 +54,6 @@ async def remove_watch_by_nickname(db: aiosqlite.Connection, user_id: int, nickn
     await db.commit()
     return int(cur.rowcount or 0)
 
-async def clear_watchlist(db: aiosqlite.Connection, user_id: int) -> int:
-    cur = await db.execute("DELETE FROM watchlist WHERE user_id = ?", (user_id,))
-    await db.commit()
-    return int(cur.rowcount or 0)
 
 async def watchers_for_keycodes(
     db: aiosqlite.Connection, keycodes: Iterable[str]
@@ -404,3 +400,27 @@ async def get_user_prototype_by_nickname(
     )
     row = await cur.fetchone()
     return row
+
+async def delete_all_user_prototypes_return_paths(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+) -> list[str]:
+    """
+    Deletes all watched prototypes for a user and returns their image_path list
+    so the caller can delete files from disk.
+    """
+    cur = await db.execute(
+        "SELECT image_path FROM user_prototypes WHERE owner_user_id = ?",
+        (int(owner_user_id),),
+    )
+    rows = await cur.fetchall()
+    paths = [str(r[0]) for r in rows if r and r[0]]
+
+    await db.execute(
+        "DELETE FROM user_prototypes WHERE owner_user_id = ?",
+        (int(owner_user_id),),
+    )
+    await db.commit()
+
+    return paths
