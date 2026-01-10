@@ -1146,7 +1146,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shown = proto_rows[:max_show]
             for proto_id, nickname, th, created_at in shown:
             # th can be NULL if you have old rows; fall back to default
-                th_val = float(th) if th is not None else 0.70
+                th_val = float(th) if th is not None else 0.73
                 lines.append(f"- *{nickname}* - th={th_val:.2f}")
 
             if len(proto_rows) > max_show:
