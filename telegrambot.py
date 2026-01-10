@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from typing import Final,Iterable, List, Set, Dict, Tuple, Optional
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
-    InputFile, InputMediaPhoto
+    InputFile, InputMediaPhoto, User
 )
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import TelegramError, Forbidden, BadRequest
@@ -899,7 +899,7 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Useful context for DM message
     group_title = chat.title or str(chat.id)
-    sender = update.effective_user
+    sender = update.effective_user if update.effective_user else "Someone"
     sender_mention = html_mention(sender)
 
     # Optional: show @username too (if present)
@@ -1165,17 +1165,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     help_text = (
+        "Recommended usage:\n"
+        "Send a card image to me, then use /watch to save it to your watchlist.\n"
+        "I will notify you when I find your card in a group.\n"
+        "Text me in a private chat for commands.\n"
+        "\n"
         "Available commands:\n"
         "/start - Start the bot\n"
         "/help - Show this help message\n"
-        "/watch <nickname> - Save the last detected card as a watched prototype (DM only)\n"
-        "/unwatch <nickname> - Remove a watched prototype (DM only)\n"
-        "/watchlist - Show your current watchlist (DM only)\n"
-        "/clearwatchlist - Remove all cards from your watchlist (DM only)\n"
+        "/watch <nickname> - Add the last detected card in your watchlist\n"
+        "/unwatch <nickname> - Remove a card from your watchlist\n"
+        "/watchlist - Show your current watchlist\n"
+        "/clearwatchlist - Remove all cards from your watchlist\n"
         "/setthreshold <nickname> <threshold> - Set similarity threshold for a watched card\n"
+        "/show <nickname> - Show details for a watched card\n"
         "\n"
-        "Threshold guide (similarity): Very likely ≥ 0.77 | Quite likely 0.73–0.77 | Possible 0.68–0.73\n"
-        "Tip: Too many false positives → raise by +0.02. Missing matches → lower by −0.02.\n"
+        "Threshold guide (similarity): \n"
+        "I will notify you only when the similarity is above the threshold you set.\n"
+        "Set a higher threshold to reduce false positives, or a lower threshold to catch more matches.\n"
+        "(Very likely ≥ 0.77 | Quite likely 0.73–0.77 | Possible 0.68–0.73)\n"
     )
 
     chat = update.effective_chat
