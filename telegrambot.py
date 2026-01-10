@@ -56,11 +56,12 @@ TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
 
 TEL_CROPPER_MODEL_PATH = str(Path("vision") / "tel_cropper" / "weights" / "best.pt")
 
-WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.70"))  # tune later
+WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.70"))  # global default threshold for watchers
 TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
 TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
 TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
 TEL_CROPPER_MAX_CROPS = int(os.getenv("TEL_CROPPER_MAX_CROPS", "32"))
+WATCH_MAX_MATCHES_PER_MESSAGE = int(os.getenv("WATCH_MAX_MATCHES_PER_MESSAGE", "3")) # how many per message to notify about
 
 EMBED_TF = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -738,7 +739,6 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
 
-    # De-dup per (chat_id, message_id, user_id) is done at notify time; still we crop once per message.
     try:
         image_bytes = await download_best_photo_bytes(update, context)
     except Exception as e:
@@ -754,6 +754,10 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     imgsz = int(context.application.bot_data.get("tel_cropper_imgsz", 960))
     pad = float(context.application.bot_data.get("tel_cropper_pad", 0.01))
     max_crops = int(context.application.bot_data.get("tel_cropper_max_crops", 6))
+
+    # Policy: notify up to K matches per user per group message
+    K = int(context.application.bot_data.get("watch_max_matches_per_message", 3))
+    K = max(1, min(K, 8))  # safety cap
 
     # 1) Crop telegram image (blocking -> thread)
     try:
@@ -796,7 +800,6 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not crop_items:
         return
 
-
     # 3) Ensure prototypes cache is ready
     if context.application.bot_data.get("proto_cache_dirty", True) or not context.application.bot_data.get("proto_cache"):
         try:
@@ -818,7 +821,9 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = chat.id
 
     now = time.time()
-    notified_triplets: dict[tuple[int, int, int], float] = context.application.bot_data.setdefault("notified_triplets", {})
+    notified_triplets: dict[tuple[int, int, int], float] = context.application.bot_data.setdefault(
+        "notified_triplets", {}
+    )
     ttl = int(context.application.bot_data.get("notified_ttl_seconds", 3600))
     prune_every = int(context.application.bot_data.get("notified_prune_every", 5000))
 
@@ -828,9 +833,11 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for k, ts in list(notified_triplets.items()):
             if ts < cutoff:
                 del notified_triplets[k]
-    # 4) Compare per user and notify at most once per message
+
+    # 4) Compare per user and notify at most once per message (but include up to K matches)
     for user_id, d in proto_cache.items():
-        triplet = (chat_id, msg_id, int(user_id))
+        uid = int(user_id)
+        triplet = (chat_id, msg_id, uid)
         if triplet in notified_triplets:
             continue
 
@@ -844,55 +851,67 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif not isinstance(ths, np.ndarray):
             ths = np.array(ths, dtype=np.float32)
 
-        best_sim = -1.0
-        best_nick = None
-        best_crop_bytes = None
-        best_th = None
+        # Collect all passing matches; dedup by nickname keeping best similarity
+        # matches[nick] = (sim, crop_bytes, threshold_used)
+        matches: dict[str, tuple[float, bytes, float]] = {}
 
-        # Find best match across crops, but ONLY among prototypes that pass their own threshold
         for cb, v in crop_items:
-            sims = mat @ v                  # (M,)
+            sims = mat @ v
             j = int(np.argmax(sims))
             s = float(sims[j])
             th_j = float(ths[j])
+            nick = nicks[j]
 
-            if s >= th_j and s > best_sim:
-                best_sim = s
-                best_nick = nicks[j]
-                best_crop_bytes = cb
-                best_th = th_j
+            if s < th_j:
+                continue
 
-        # If nothing passed its own threshold, do not notify
-        if best_nick is None or best_crop_bytes is None:
+            prev = matches.get(nick)
+            if prev is None or s > prev[0]:
+                matches[nick] = (s, cb, th_j)
+
+        if not matches:
             continue
 
+        # Sort and keep top-K
+        top = sorted(matches.items(), key=lambda kv: kv[1][0], reverse=True)[:K]
 
         # Mark de-dup before sending to avoid double-notifies on retry
         notified_triplets[triplet] = now
 
-
-        caption = (
-            f"Match found in group: {group_title}\n"
-            f"Watched: {best_nick}\n"
-            f"Similarity: {best_sim:.3f} (threshold {best_th:.2f})\n"
-            f"Posted by: {sender_name}"
-        )
-
+        # Send summary + up to K crop images
+        summary_lines = [
+            f"Match(es) found in group: {group_title}",
+            f"Posted by: {sender_name}",
+            "",
+            "Top matches:",
+        ]
+        for rank, (nick, (sim, _cb, th_used)) in enumerate(top, start=1):
+            summary_lines.append(f"{rank}. {nick} — sim {sim:.3f} (th {th_used:.2f})")
 
         try:
-            bio = io.BytesIO(best_crop_bytes)
-            bio.name = "match.png"
-            await context.bot.send_photo(
-                chat_id=int(user_id),
-                photo=InputFile(bio),
-                caption=caption,
-            )
+            await context.bot.send_message(chat_id=uid, text="\n".join(summary_lines))
         except (Forbidden, BadRequest):
             # User hasn't started bot / cannot be messaged; silently skip
             continue
         except TelegramError as e:
-            logger.warning("Failed to DM user %s: %s", user_id, e)
+            logger.warning("Failed to DM summary to user %s: %s", uid, e)
             continue
+
+        for rank, (nick, (sim, cb, th_used)) in enumerate(top, start=1):
+            caption = f"{rank}/{len(top)} — {nick}\nSimilarity: {sim:.3f} (threshold {th_used:.2f})"
+            try:
+                bio = io.BytesIO(cb)
+                bio.name = "match.png"
+                await context.bot.send_photo(
+                    chat_id=uid,
+                    photo=InputFile(bio),
+                    caption=caption,
+                )
+            except (Forbidden, BadRequest):
+                break
+            except TelegramError as e:
+                logger.warning("Failed to DM user %s match photo: %s", uid, e)
+                continue
 
 # Callback handler for inline buttons
 async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1221,17 +1240,15 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
         text = f"Removed learned card `{nickname}`."
 
-    # If invoked outside private, DM result
+    # If invoked outside private: DM result and stay silent in the group
     if chat and chat.type != "private":
         try:
             await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
-            await update.message.reply_text("Done. I sent you the result in DM.")
         except (Forbidden, BadRequest):
-            await update.message.reply_text(
-                "I can't DM you yet. Please open a private chat with me, press Start, then try again."
-            )
-        except TelegramError:
-            await update.message.reply_text("Telegram error while sending DM.")
+            # Can't DM user (likely hasn't started the bot). Stay silent in group.
+            logger.info("Cannot DM user %s (hasn't started bot?) for /unwatch result.", user_id)
+        except TelegramError as e:
+            logger.warning("Telegram error while DMing user %s: %s", user_id, e)
         return
 
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -1457,6 +1474,7 @@ async def post_init(app: Application):
     app.bot_data["tel_cropper_max_crops"] = TEL_CROPPER_MAX_CROPS
 
     app.bot_data["watch_sim_threshold"] = WATCH_SIM_THRESHOLD
+    app.bot_data["watch_max_matches_per_message"] = WATCH_MAX_MATCHES_PER_MESSAGE
 
     # watched-prototypes cache
     app.bot_data["proto_cache_dirty"] = True
