@@ -1542,7 +1542,7 @@ async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # mark cache dirty so group matching sees new threshold
     context.application.bot_data["proto_cache_dirty"] = True
 
-    await reply_privately(
+    await reply_privately(update, context,
         f"Updated threshold for `{nickname}` to {th:.2f}.",
         parse_mode="Markdown",
     )
