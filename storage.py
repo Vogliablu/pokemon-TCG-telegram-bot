@@ -381,3 +381,26 @@ async def upsert_single_pending_prototype(
 
     await db.commit()
     return old_path
+
+
+async def get_user_prototype_by_nickname(
+    db: aiosqlite.Connection,
+    *,
+    owner_user_id: int,
+    nickname: str,
+) -> Optional[tuple]:
+    """
+    Returns a single prototype row for (owner_user_id, nickname), or None.
+    Expected columns: id, nickname, image_path, telegram_file_id, threshold
+    Adjust SELECT columns if your schema differs.
+    """
+    cur = await db.execute(
+        """
+        SELECT id, nickname, image_path, telegram_file_id, threshold
+        FROM user_prototypes
+        WHERE owner_user_id = ? AND nickname = ?
+        """,
+        (int(owner_user_id), nickname),
+    )
+    row = await cur.fetchone()
+    return row

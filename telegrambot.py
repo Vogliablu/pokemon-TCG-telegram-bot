@@ -31,7 +31,8 @@ from storage import (
     create_user_prototype_from_pending,
     delete_user_prototype_by_nickname,
     set_user_prototype_threshold,
-    upsert_single_pending_prototype
+    upsert_single_pending_prototype,
+    get_user_prototype_by_nickname
 )
 import uuid
 import asyncio
@@ -56,7 +57,7 @@ TEL_CROPPER_PATH  = VISION_ROOT / "tel_cropper" / "weights" / "best.pt"
 
 TEL_CROPPER_MODEL_PATH = str(Path("vision") / "tel_cropper" / "weights" / "best.pt")
 
-WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.70"))  # global default threshold for watchers
+WATCH_SIM_THRESHOLD = float(os.getenv("WATCH_SIM_THRESHOLD", "0.73"))  # global default threshold for watchers
 TEL_CROPPER_CONF = float(os.getenv("TEL_CROPPER_CONF", "0.25"))
 TEL_CROPPER_IMGSZ = int(os.getenv("TEL_CROPPER_IMGSZ", "960"))
 TEL_CROPPER_PAD = float(os.getenv("TEL_CROPPER_PAD", "0.01"))
@@ -100,14 +101,82 @@ BOT_USERNAME: Final = '@Pokemon_Card_tracker_bot'
 CARD_RATIO_PORTRAIT = 63 / 88
 
 # Helpers
-def _image_looks_like_single_card(img: Image.Image, tol: float = 0.18) -> bool:
-    w, h = img.size
-    if w < 20 or h < 20:
+def command_is_addressed_to_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.effective_message
+    if not msg or not msg.text:
         return False
-    r = w / h
-    rp = CARD_RATIO_PORTRAIT
-    rl = 1.0 / rp
-    return (abs(r - rp) <= tol) or (abs(r - rl) <= tol)
+
+    # Command entity at the start of the message
+    ent = None
+    for e in (msg.entities or []):
+        if e.type == "bot_command" and e.offset == 0:
+            ent = e
+            break
+    if not ent:
+        return False
+
+    cmd_text = msg.text[ent.offset : ent.offset + ent.length]  # e.g. "/help@MyBot" or "/help"
+    if "@" not in cmd_text:
+        # In groups, require explicit @mention
+        return msg.chat.type == "private"
+
+    _, at = cmd_text.split("@", 1)
+    return at.lower() == (context.bot.username or "").lower()
+
+def message_is_addressed_to_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    True if:
+      - private chat: always True
+      - group/supergroup: only True when command is like /cmd@MyBot
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg or not msg.text:
+        return False
+
+    if chat.type == "private":
+        return True
+
+    if chat.type not in ("group", "supergroup"):
+        return False
+
+    # Find a bot_command entity at the beginning of the message
+    ent = None
+    for e in (msg.entities or []):
+        if e.type == "bot_command" and e.offset == 0:
+            ent = e
+            break
+    if ent is None:
+        return False
+
+    cmd_text = msg.text[ent.offset : ent.offset + ent.length]  # e.g. "/help@MyBot" or "/help"
+    if "@" not in cmd_text:
+        # In groups, require explicit @mention
+        return False
+
+    _, at = cmd_text.split("@", 1)
+    at = at.strip().lower()
+
+    my_username = context.application.bot_data.get("bot_username", "")
+    return bool(my_username) and at == my_username
+
+async def reply_privately(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> None:
+    chat = update.effective_chat
+    if chat and chat.type == "private" and update.message:
+        await update.message.reply_text(text, parse_mode=parse_mode)
+    else:
+        # group/supergroup (or unknown): DM only, silent on failure
+        ok = await send_dm_only(update, context, text, parse_mode=parse_mode)
+        if not ok and update.effective_user:
+            logger.info("Cannot DM user %s (hasn't started bot?)", update.effective_user.id)
+
+
 
 def _clamp_int(v: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(v)))
@@ -207,6 +276,7 @@ def _image_looks_like_single_card(img: Image.Image, tol: float = 0.18) -> bool:
     rp = CARD_RATIO_PORTRAIT
     rl = 1.0 / rp
     return (abs(r - rp) <= tol) or (abs(r - rl) <= tol)
+
 
 def _expand_box_to_aspect(xyxy, img_w: int, img_h: int, ratio_portrait: float = CARD_RATIO_PORTRAIT):
     x1, y1, x2, y2 = map(float, xyxy)
@@ -380,7 +450,7 @@ async def rebuild_user_prototypes_cache(db: aiosqlite.Connection) -> dict[int, d
         d = tmp.setdefault(uid, {"ids": [], "nicks": [], "ths": [], "vecs": []})
         d["ids"].append(int(proto_id))
         d["nicks"].append(str(nickname))
-        d["ths"].append(float(threshold) if threshold is not None else 0.70)
+        d["ths"].append(float(threshold) if threshold is not None else 0.73)
         d["vecs"].append(v)
 
     cache: dict[int, dict[str, object]] = {}
@@ -584,6 +654,19 @@ async def send_dm_only(
         return False
     except TelegramError:
         return False
+
+def html_mention(user: User | None) -> str:
+    if not user:
+        return "Someone"
+    name = user.full_name or "Someone"
+    # minimal HTML escaping for safety
+    name = (
+        name.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
 
 async def handle_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
@@ -816,7 +899,13 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Useful context for DM message
     group_title = chat.title or str(chat.id)
-    sender_name = update.effective_user.full_name if update.effective_user else "Someone"
+    sender = update.effective_user
+    sender_mention = html_mention(sender)
+
+    # Optional: show @username too (if present)
+    sender_username = ""
+    if sender and sender.username:
+        sender_username = f" (@{sender.username})"    
     msg_id = update.message.message_id
     chat_id = chat.id
 
@@ -847,7 +936,7 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Safety fallback if cache lacks thresholds
         if ths is None:
-            ths = np.full((mat.shape[0],), 0.70, dtype=np.float32)
+            ths = np.full((mat.shape[0],), 0.73, dtype=np.float32)
         elif not isinstance(ths, np.ndarray):
             ths = np.array(ths, dtype=np.float32)
 
@@ -880,16 +969,21 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Send summary + up to K crop images
         summary_lines = [
-            f"Match(es) found in group: {group_title}",
-            f"Posted by: {sender_name}",
-            "",
-            "Top matches:",
-        ]
+        f"Match(es) found in group: {group_title}",
+        f"Posted by: {sender_mention}{sender_username}",
+        "",
+        "Top matches:",
+]
         for rank, (nick, (sim, _cb, th_used)) in enumerate(top, start=1):
             summary_lines.append(f"{rank}. {nick} — sim {sim:.3f} (th {th_used:.2f})")
 
         try:
-            await context.bot.send_message(chat_id=uid, text="\n".join(summary_lines))
+            await context.bot.send_message(
+                chat_id=uid,
+                text="\n".join(summary_lines),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
         except (Forbidden, BadRequest):
             # User hasn't started bot / cannot be messaged; silently skip
             continue
@@ -1062,9 +1156,14 @@ async def handle_nickname_reply(update: Update, context: ContextTypes.DEFAULT_TY
 # Commands
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not message_is_addressed_to_me(update, context):
+        return
     await update.message.reply_text('Hello! I am your Pokemon Card Tracker Bot. Use /help to see what I can do!')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not message_is_addressed_to_me(update, context):
+        return
+
     help_text = (
         "Available commands:\n"
         "/start - Start the bot\n"
@@ -1082,43 +1181,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat = update.effective_chat
     if chat and chat.type != "private":
         # DM only; do not reply in the group
-        await send_dm_only(update, context, help_text)
+        await reply_privately(update, context, help_text)
         return
 
     await update.message.reply_text(help_text)
 
-async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('This is a custom command response!')
 
 def _normalize_nickname(n: str) -> str:
     return n.strip().lower()
 
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not message_is_addressed_to_me(update, context):
+        return        
+    
     if not update.message or not update.effective_chat:
         return
     if update.effective_chat.type != "private":
-        await send_dm_only(update, context, "Use /watch in a private chat with me.")
+        await reply_privately(update, context, "Use /watch in a private chat with me.")
         return
     
     db: aiosqlite.Connection = context.application.bot_data["db"]
     user_id = update.effective_user.id
 
     if not context.args and update.effective_chat.type == "private":
-        await update.message.reply_text("Usage: First send an image of your card, then use `/watch <nickname>`", parse_mode="Markdown")
+        await reply_privately(update, context, "Usage: First send an image of your card, then use `/watch <nickname>`", parse_mode="Markdown")
         return
 
     nickname = _normalize_nickname(" ".join(context.args))
     if not nickname:
-        await update.message.reply_text("Nickname cannot be empty.")
+        await reply_privately(update, context, "Nickname cannot be empty.")
         return
     if len(nickname) > 40:
-        await update.message.reply_text("Nickname is too long (max 40 chars).")
+        await reply_privately(update, context, "Nickname is too long (max 40 chars).")
         return
 
     # Prefer token from user_data, but fall back to latest pending in DB
     pending = await get_latest_pending_prototype(db, owner_user_id=user_id)
     if not pending:
-        await update.message.reply_text("No pending card found. Send me a card photo first.")
+        await reply_privately(update, context, "No pending card found. Send me a card photo first.")
         return
 
     token, image_path, emb_blob, dim, norm, model = pending
@@ -1136,14 +1236,14 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         
     except sqlite3.IntegrityError:
-        await update.message.reply_text(
+        await reply_privately(update, context,
             f"You already have a watched card named `{nickname}`. Choose another nickname.",
             parse_mode="Markdown",
         )
         return
     except Exception as e:
         logger.exception("Failed to create user prototype: %s", e)
-        await update.message.reply_text("Failed to save this watched card. Please try again.")
+        await reply_privately(update, context, "Failed to save this watched card. Please try again.")
         return
     context.application.bot_data["proto_cache_dirty"] = True
 
@@ -1155,13 +1255,16 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     context.user_data.pop("pending_token", None)
 
-    await update.message.reply_text(
-        f"Saved. I will watch this card as `{nickname}` (id={proto_id}).",
+    await reply_privately(update, context,
+        f"Saved. I will watch this card as `{nickname}`.",
         parse_mode="Markdown",
     )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not message_is_addressed_to_me(update, context):
+        return  
+    
     if not update.message or not update.effective_chat:
         return
     if update.effective_chat.type != "private":
@@ -1172,7 +1275,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     pending = await get_latest_pending_prototype(db, owner_user_id=user_id)
     if not pending:
-        await update.message.reply_text("No pending card to cancel.")
+        await reply_privately(update, context, "No pending card to cancel.")
         return
 
     token, image_path, *_ = pending
@@ -1190,9 +1293,12 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
 
     context.user_data.pop("pending_token", None)
-    await update.message.reply_text("Cancelled. Send another card photo when ready.")
+    await reply_privately(update, context, "Cancelled. Send another card photo when ready.")
 
 async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not message_is_addressed_to_me(update, context):
+        return    
+    
     if not update.message or not update.effective_user:
         return
 
@@ -1208,14 +1314,14 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
                 #await update.message.reply_text("I sent you instructions in DM.")
             except Exception:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await reply_privately(update, context, msg, parse_mode="Markdown")
             return
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await reply_privately(update, context, msg, parse_mode="Markdown")
         return
 
     nickname = _normalize_nickname(" ".join(context.args))
     if not nickname:
-        await update.message.reply_text("Nickname cannot be empty.")
+        await reply_privately(update, context, "Nickname cannot be empty.")
         return
 
     try:
@@ -1224,7 +1330,7 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     except Exception as e:
         logger.exception("Failed to delete user prototype: %s", e)
-        await update.message.reply_text("Failed to remove that card. Please try again.")
+        await reply_privately(update, context, "Failed to remove that card. Please try again.")
         return
 
     if image_path is None:
@@ -1251,7 +1357,7 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.warning("Telegram error while DMing user %s: %s", user_id, e)
         return
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await reply_privately(update, context, text, parse_mode="Markdown")
 
 # async def identify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     if not update.message:
@@ -1268,6 +1374,9 @@ async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 #     )
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not message_is_addressed_to_me(update, context):
+        return    
+    
     if not update.effective_user or not update.message:
         return
 
@@ -1311,7 +1420,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for proto_id, nickname, th, created_at in shown:
             # th can be NULL if you have old rows; fall back to default
                 th_val = float(th) if th is not None else 0.70
-                lines.append(f"- *{nickname}* (id={proto_id}, th={th_val:.2f})")
+                lines.append(f"- *{nickname}* - th={th_val:.2f}")
 
             if len(proto_rows) > max_show:
                 lines.append(f"(+{len(proto_rows) - max_show} more not shown)")
@@ -1348,9 +1457,12 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         #     await update.message.reply_text("Failed to retrieve your watchlist due to a Telegram error.")
         return
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await reply_privately(update, context, text, parse_mode="Markdown")
 
 async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not message_is_addressed_to_me(update, context):
+        return   
+   
     if not update.effective_user or not update.message:
         return
 
@@ -1359,7 +1471,7 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # Avoid running destructive ops from group chats
     if chat and chat.type != "private":
-        await send_dm_only(update,context,"Please DM me /clearwatchlist to clear your personal watchlist.")
+        await reply_privately(update, context, "Please DM me /clearwatchlist to clear your personal watchlist.")
         return
 
     # Safety confirmation
@@ -1374,9 +1486,12 @@ async def clearwatchlist_command(update: Update, context: ContextTypes.DEFAULT_T
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
     removed = await db_clear_watchlist(db, user_id)
-    await update.message.reply_text(f"Cleared your watchlist. Removed {removed} entr(y/ies).")
+    await reply_privately(update, context, f"Cleared your watchlist. Removed {removed} entr(y/ies).")
 
 async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not message_is_addressed_to_me(update, context):
+        return
+    
     if not update.message or not update.effective_chat:
         return
     # if update.effective_chat.type != "private":
@@ -1384,7 +1499,7 @@ async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYP
     #     return
 
     if len(context.args) < 2:
-        await send_dm_only(update, context,
+        await reply_privately(update, context,
             "Usage: `/setthreshold <nickname> <value>`\nExample: `/setthreshold charizard 0.86`",
             parse_mode="Markdown",
         )
@@ -1396,11 +1511,11 @@ async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         th = float(val_str)
     except ValueError:
-        await update.message.reply_text("Threshold must be a number like 0.86.")
+        await reply_privately(update, context, "Threshold must be a number like 0.86.")
         return
 
     if not (0.0 < th < 1.0):
-        await update.message.reply_text("Threshold must be between 0 and 1 (e.g., 0.86).")
+        await reply_privately(update, context, "Threshold must be between 0 and 1 (e.g., 0.86).")
         return
 
     db: aiosqlite.Connection = context.application.bot_data["db"]
@@ -1408,18 +1523,87 @@ async def setthreshold_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     n = await set_user_prototype_threshold(db, owner_user_id=user_id, nickname=nickname, threshold=th)
     if n == 0:
-        await update.message.reply_text(f"No learned card named `{nickname}` found.", parse_mode="Markdown")
+        await reply_privately(update, context, f"No learned card named `{nickname}` found.", parse_mode="Markdown")
         return
 
     # mark cache dirty so group matching sees new threshold
     context.application.bot_data["proto_cache_dirty"] = True
 
-    await update.message.reply_text(
+    await reply_privately(
         f"Updated threshold for `{nickname}` to {th:.2f}.",
         parse_mode="Markdown",
     )
 
+def looks_like_telegram_file_id(s: str | None) -> bool:
+    if not s:
+        return False
+    s = s.strip()
+    return (len(s) > 20) and ("://" not in s) and ("/" not in s)
 
+async def show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Usage: /show <nickname>
+    Sends the saved prototype image for that nickname (DM only response).
+    In groups, executes only if the command is explicitly addressed to the bot,
+    and still replies via DM only.
+    """
+    if not update.effective_user or not update.effective_chat:
+        return
+    if not message_is_addressed_to_me(update, context):
+        return
+
+    user_id = update.effective_user.id
+    db: aiosqlite.Connection = context.application.bot_data["db"]
+
+    if not context.args:
+        await reply_privately(update, context, "Usage: `/show <nickname>`", parse_mode="Markdown")
+        return
+
+    nickname = _normalize_nickname(" ".join(context.args))
+    if not nickname:
+        await reply_privately(update, context, "Nickname cannot be empty.")
+        return
+
+    row = await get_user_prototype_by_nickname(db, owner_user_id=user_id, nickname=nickname)
+    if not row:
+        await reply_privately(update, context, f"No watched card named `{nickname}` found.", parse_mode="Markdown")
+        return
+
+    proto_id, nick, image_path, telegram_file_id, threshold = row
+
+    caption = f"{nick} (th={float(threshold):.2f})"
+
+    # Prefer cached telegram_file_id if available
+    if looks_like_telegram_file_id(telegram_file_id):
+        try:
+            await context.bot.send_photo(chat_id=user_id, photo=telegram_file_id, caption=caption)
+            return
+        except TelegramError:
+            # fall back to disk if possible
+            pass
+
+    # Fallback: load from disk path
+    if image_path and str(image_path).strip():
+        p = Path(str(image_path)).expanduser()
+        if p.is_file():
+            try:
+                with p.open("rb") as f:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=InputFile(f, filename=p.name),
+                        caption=caption,
+                    )
+                return
+            except (Forbidden, BadRequest):
+                return
+            except TelegramError as e:
+                logger.warning("Failed to send prototype image for user %s: %s", user_id, e)
+
+    await reply_privately(
+        update,
+        context,
+        "I found the watched card in the database, but its image file is missing on disk.",
+    )
 
 # Responses
 
@@ -1452,6 +1636,8 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 async def post_init(app: Application):
+    me = await app.bot.get_me()
+    app.bot_data["bot_username"] = (me.username or "").lower()
     # ---- Init DB ----
     db = await init_db(DB_PATH)
     app.bot_data["db"] = db
@@ -1518,6 +1704,7 @@ async def post_init(app: Application):
         BotCommand("watchlist", "Show your watchlist"),
         BotCommand("clearwatchlist", "Remove all cards from your watchlist"),
         BotCommand("setthreshold", "Set per-card threshold: /setthreshold <nickname> <value>"),
+        BotCommand("show", "Show a watched card image by nickname")
 
 
     ])
@@ -1535,7 +1722,7 @@ if __name__ == '__main__':
     # Commands
     app.add_handler(CommandHandler('start', start_command))
     app.add_handler(CommandHandler('help', help_command))
-    app.add_handler(CommandHandler('custom', custom_command))
+    # app.add_handler(CommandHandler('custom', custom_command))
     app.add_handler(CommandHandler('unwatch', unwatch_command))
     #app.add_handler(CommandHandler('identify', identify_command))
     app.add_handler(CommandHandler('watchlist', watchlist_command))
@@ -1543,7 +1730,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("watch", watch_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("setthreshold", setthreshold_command))
-
+    app.add_handler(CommandHandler("show", show_command))
 
     # Photo Handlers
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_private_photo))
@@ -1577,4 +1764,7 @@ if __name__ == '__main__':
 
     # Run the bot
     print('Bot is running...')
-    app.run_polling(poll_interval=3)
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        poll_interval=3,
+    )
