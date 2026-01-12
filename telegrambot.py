@@ -1365,20 +1365,21 @@ def handle_response(txt: str) -> str:
         return 'Hello there!'
     return "I didn't understand that. Type /help for assistance."
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_type: str = update.message.chat.type
-    text: str = update.message.text
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
 
-    print(f'User: {update.message.chat.id} in {message_type} : "{text}"')
+    chat_type = update.effective_chat.type
+    text = update.message.text or ""
 
-    if message_type == 'group':
-        if BOT_USERNAME in text:
-            new_text: str = text.replace(BOT_USERNAME, '').strip()
-            response: str = handle_response(new_text)
-        else:
-            return
-    else:
-        response: str = handle_response(text)
+    # Do not reply to any messages in groups/supergroups/channels.
+    # Only respond in private chats.
+    if chat_type != "private":
+        return
+
+    print(f'User: {update.effective_chat.id} in {chat_type} : "{text}"')
+
+    response: str = handle_response(text)
 
     print(f'Bot: "{response}"')
     await update.message.reply_text(response)
